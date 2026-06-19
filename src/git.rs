@@ -52,7 +52,7 @@ impl GitManager {
 
     pub fn diff_uncommitted(&self) -> Result<String> {
         let repo = self.repo.lock().unwrap();
-        let head = last_commit(&repo);
+        let head = self.last_commit();
         let tree = match &head {
             Ok(c) => c.tree().ok(),
             Err(_) => None,
@@ -61,11 +61,39 @@ impl GitManager {
         let mut opts = DiffOptions::new();
         opts.context_lines(2);
 
-        let diff = repo
-            .diff_tree_to_workdir(tree.as_ref(), Some(&mut opts))
-            .context("Failed to get diff")?;
+        let mut output = String::new();
 
-        format_diff(&diff)
+        // Diff tracked files
+        if let Ok(diff) = repo.diff_tree_to_workdir(tree.as_ref(), Some(&mut opts)) {
+            output.push_str(&format_diff(&diff));
+        }
+
+        // Show untracked files (new files not yet tracked by git)
+        let mut status_opts = StatusOptions::new();
+        status_opts.include_untracked(true);
+        if let Ok(statuses) = repo.statuses(Some(&mut status_opts)) {
+            for entry in statuses.iter() {
+                let flags = entry.status();
+                if flags.contains(git2::Status::WT_NEW) || flags.contains(git2::Status::INDEX_NEW) {
+                    let path = entry.path().unwrap_or("?");
+                    output.push_str(&format!("+ {}", path));
+                    output.push('\n');
+                    // Show first few lines of new file content
+                    if let Ok(content) = std::fs::read_to_string(
+                        std::path::Path::new(&self.workdir).join(path)
+                    ) {
+                        for line in content.lines().take(10) {
+                            output.push_str(&format!("+{}\n", line));
+                        }
+                        if content.lines().count() > 10 {
+                            output.push_str("+...\n");
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(output)
     }
 
     pub fn status(&self) -> Result<Vec<String>> {

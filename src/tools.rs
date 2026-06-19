@@ -154,16 +154,30 @@ impl Tool for EditTool {
                 Some(pos) => {
                     let new_content = content.replacen(&old, &new, 1);
                     match tokio::fs::write(&path, &new_content).await {
-                        Ok(()) => Ok(ToolOutput {
-                            content: vec![ToolContent::Text {
-                                text: format!(
-                                    "Replaced {} chars at position {} in {}",
-                                    old.len(),
-                                    pos,
-                                    path
-                                ),
-                            }],
-                        }),
+                        Ok(()) => {
+                            // Build a readable diff: show changed lines with context
+                            let old_lines: Vec<&str> = old.lines().collect();
+                            let new_lines: Vec<&str> = new.lines().collect();
+                            let mut diff_text = format!("Edit {}\n", path);
+                            let context_before = content[..pos].lines().last().unwrap_or("");
+                            if !context_before.is_empty() {
+                                diff_text.push_str(&format!("    {}\n", context_before));
+                            }
+                            for line in &old_lines {
+                                diff_text.push_str(&format!("-{}\n", line));
+                            }
+                            for line in &new_lines {
+                                diff_text.push_str(&format!("+{}\n", line));
+                            }
+                            let after_pos = pos + old.len();
+                            let context_after = content[after_pos..].lines().next().unwrap_or("");
+                            if !context_after.is_empty() {
+                                diff_text.push_str(&format!("    {}\n", context_after));
+                            }
+                            Ok(ToolOutput {
+                                content: vec![ToolContent::Text { text: diff_text }],
+                            })
+                        }
                         Err(e) => Err(ToolError::Execution(format!("Write error: {}", e))),
                     }
                 }

@@ -180,14 +180,17 @@ fn draw_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppStat
         }
     }
 
-    // Show streaming response text while generating
+    // Show streaming response text while generating (no truncation)
     if state.thinking && !state.streaming_text.is_empty() {
-        let preview = truncate(&state.streaming_text, 400);
-        for line in preview.lines() {
-            lines.push(Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(Color::White),
-            )));
+        for line in state.streaming_text.lines() {
+            if line.starts_with("```") {
+                lines.push(Line::from(Span::styled(
+                    line,
+                    Style::default().fg(Color::Yellow),
+                )));
+            } else {
+                lines.push(Line::from(Span::raw(line.to_string())));
+            }
         }
         lines.push(Line::from(""));
     }

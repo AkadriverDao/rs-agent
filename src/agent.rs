@@ -389,7 +389,8 @@ impl Agent {
                 debug!("Executing {} tool calls...", pending_tool_calls.len());
 
                 for call in &pending_tool_calls {
-                    let input = summarize_value(&call.input, 80);
+                    let max = if call.name == "write" { 200 } else { 80 };
+                    let input = summarize_value(&call.input, max);
                     self.emit(ProgressEvent::ToolCallStarted {
                         name: call.name.clone(),
                         input,

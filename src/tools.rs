@@ -160,45 +160,58 @@ impl Tool for EditTool {
                 Ok(c) => c,
                 Err(e) => return Err(ToolError::Execution(format!("Read error: {}", e))),
             };
-            match content.find(&old) {
-                Some(pos) => {
-                    let new_content = content.replacen(&old, &new, 1);
-                    match tokio::fs::write(&path, &new_content).await {
-                        Ok(()) => {
-                            // Build a readable diff: show changed lines with context
-                            let old_lines: Vec<&str> = old.lines().collect();
-                            let new_lines: Vec<&str> = new.lines().collect();
-                            let mut diff_text = format!("Edit {}\n", path);
-                            let context_before = content[..pos].lines().last().unwrap_or("");
-                            if !context_before.is_empty() {
-                                diff_text.push_str(&format!("    {}\n", context_before));
-                            }
-                            for line in &old_lines {
-                                diff_text.push_str(&format!("-{}\n", line));
-                            }
-                            for line in &new_lines {
-                                diff_text.push_str(&format!("+{}\n", line));
-                            }
-                            let after_pos = pos + old.len();
-                            let context_after = content[after_pos..].lines().next().unwrap_or("");
-                            if !context_after.is_empty() {
-                                diff_text.push_str(&format!("    {}\n", context_after));
-                            }
-                            Ok(ToolOutput {
-                                content: vec![ToolContent::Text { text: diff_text }],
-                            })
-                        }
-                        Err(e) => Err(ToolError::Execution(format!("Write error: {}", e))),
+
+            // Try exact match first
+            let (matched_old, pos) = match content.find(&old) {
+                Some(pos) => (old.as_str(), pos),
+                None => {
+                    // Fuzzy match: normalize whitespace on both sides
+                    let normalized = normalize_whitespace(&content);
+                    let norm_old = normalize_whitespace(&old);
+                    if let Some(norm_pos) = normalized.find(&norm_old) {
+                        // Find the corresponding position in the original content
+                        let content_before = &normalized[..norm_pos];
+                        let orig_before = find_orig_position(&content, content_before);
+                        // Verify we found the right position
+                        (&content[orig_before..], orig_before)
+                    } else {
+                        let preview = content.lines().take(5).collect::<Vec<_>>().join("\n");
+                        return Err(ToolError::Execution(format!(
+                            "Could not find text in {}. First 5 lines:\n{}",
+                            path, preview
+                        )));
                     }
                 }
-                None => {
-                    // Show context around where it failed
-                    let preview = content.lines().take(5).collect::<Vec<_>>().join("\n");
-                    Err(ToolError::Execution(format!(
-                        "Could not find the specified text in {}. First 5 lines of file:\n{}",
-                        path, preview
-                    )))
+            };
+
+            let matched_len = matched_old.len();
+            let new_content = format!("{}{}{}", &content[..pos], new, &content[pos + matched_len..]);
+
+            match tokio::fs::write(&path, &new_content).await {
+                Ok(()) => {
+                    let old_lines: Vec<&str> = old.lines().collect();
+                    let new_lines: Vec<&str> = new.lines().collect();
+                    let mut diff_text = format!("Edit {}\n", path);
+                    let context_before = content[..pos].lines().last().unwrap_or("");
+                    if !context_before.is_empty() {
+                        diff_text.push_str(&format!("    {}\n", context_before));
+                    }
+                    for line in &old_lines {
+                        diff_text.push_str(&format!("-{}\n", line));
+                    }
+                    for line in &new_lines {
+                        diff_text.push_str(&format!("+{}\n", line));
+                    }
+                    let after_pos = pos + matched_len;
+                    let context_after = content[after_pos..].lines().next().unwrap_or("");
+                    if !context_after.is_empty() {
+                        diff_text.push_str(&format!("    {}\n", context_after));
+                    }
+                    Ok(ToolOutput {
+                        content: vec![ToolContent::Text { text: diff_text }],
+                    })
                 }
+                Err(e) => Err(ToolError::Execution(format!("Write error: {}", e))),
             }
         })
     }
@@ -708,6 +721,51 @@ impl Tool for UndoTool {
             }
         })
     }
+}
+
+/// Normalize whitespace for fuzzy matching: trim each line, collapse multiple spaces
+fn normalize_whitespace(s: &str) -> String {
+    s.lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            // Collapse multiple spaces/tabs into single space
+            let mut prev = ' ';
+            let mut result = String::with_capacity(trimmed.len());
+            for c in trimmed.chars() {
+                if c == ' ' || c == '\t' {
+                    if prev != ' ' {
+                        result.push(' ');
+                        prev = ' ';
+                    }
+                } else {
+                    result.push(c);
+                    prev = c;
+                }
+            }
+            result
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Given the original content and a normalized substring, find the original byte position
+fn find_orig_position(original: &str, normalized_before: &str) -> usize {
+    let norm_orig = normalize_whitespace(original);
+    if let Some(norm_pos) = norm_orig.find(normalized_before) {
+        let before = &norm_orig[..norm_pos];
+        // Count non-whitespace chars to approximate position in original
+        let char_count: usize = before.chars().filter(|c| !c.is_whitespace()).count();
+        let mut count = 0;
+        for (i, c) in original.char_indices() {
+            if !c.is_whitespace() {
+                count += 1;
+                if count > char_count {
+                    return i;
+                }
+            }
+        }
+    }
+    0
 }
 
 // ── Register all built-in tools ──

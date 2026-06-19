@@ -373,13 +373,17 @@ fn event_to_string(ev: &ProgressEvent) -> String {
         }
         ProgressEvent::DiffAvailable { diff } => {
             let mut s = String::new();
-            for line in diff.lines().take(20) {
-                if line.starts_with('+') || line.starts_with('~') || line.starts_with('-') {
-                    s.push_str(&format!("  {}\n", line));
+            for line in diff.lines().take(30) {
+                if line.starts_with('+') {
+                    s.push_str(&format!("+{}\n", &line[1..]));
+                } else if line.starts_with('-') {
+                    s.push_str(&format!("-{}\n", &line[1..]));
+                } else if line.starts_with('~') {
+                    s.push_str(&format!("~{}\n", &line[1..]));
                 }
             }
-            if diff.lines().count() > 20 {
-                s.push_str("  ...\n");
+            if diff.lines().count() > 30 {
+                s.push_str("...\n");
             }
             s
         }

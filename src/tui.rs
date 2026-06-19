@@ -207,18 +207,24 @@ fn draw_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppStat
             )));
         }
         for ev in &state.live_events {
-            let color = if ev.starts_with("🔧") {
-                Color::Yellow
-            } else if ev.starts_with("✔") || ev.starts_with("✘") {
-                Color::Green
-            } else if ev.starts_with("●") {
-                Color::DarkGray
+            let (color, modifier) = if ev.starts_with('+') {
+                (Color::Green, Modifier::empty())
+            } else if ev.starts_with('-') {
+                (Color::Red, Modifier::empty())
+            } else if ev.starts_with('~') {
+                (Color::Yellow, Modifier::empty())
+            } else if ev.starts_with("→") || ev.starts_with("←") || ev.starts_with("$") {
+                (Color::Cyan, Modifier::BOLD)
+            } else if ev.starts_with("✗") || ev.starts_with("✘") {
+                (Color::Red, Modifier::BOLD)
+            } else if ev.starts_with("✔") {
+                (Color::Green, Modifier::BOLD)
             } else {
-                Color::DarkGray
+                (Color::DarkGray, Modifier::empty())
             };
             lines.push(Line::from(Span::styled(
                 ev,
-                Style::default().fg(color),
+                Style::default().fg(color).add_modifier(modifier),
             )));
         }
     }

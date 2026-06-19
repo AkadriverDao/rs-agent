@@ -8,8 +8,8 @@ use tracing::{debug, error, info, warn};
 pub enum ProgressEvent {
     LlmCall { iteration: u32 },
     Token { text: String },
-    ToolCallStarted { name: String, input: String },
-    ToolCallFinished { name: String, status: String, error: Option<String> },
+    ToolCallStarted { name: String, input: String, ts: i64 },
+    ToolCallFinished { name: String, status: String, error: Option<String>, ts: i64 },
     StepFinished { iteration: u32, tool_count: usize },
     DiffAvailable { diff: String },
     Done { text_len: usize, tool_count: usize },

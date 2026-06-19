@@ -1,22 +1,34 @@
 #include <iostream>
 #include <vector>
 
-// 冒泡排序函数
-void bubbleSort(std::vector<int>& arr) {
-    int n = arr.size();
-    for (int i = 0; i < n - 1; ++i) {
-        // 提前退出标志
-        bool swapped = false;
-        for (int j = 0; j < n - i - 1; ++j) {
-            if (arr[j] > arr[j + 1]) {
-                std::swap(arr[j], arr[j + 1]);
-                swapped = true;
-            }
+// 分区函数（快速排序辅助函数）
+int partition(std::vector<int>& arr, int low, int high) {
+    int pivot = arr[high]; // 选择最后一个元素作为基准
+    int i = low - 1;       // i 指向小于基准的最后一个元素
+
+    for (int j = low; j < high; ++j) {
+        if (arr[j] < pivot) {
+            ++i;
+            std::swap(arr[i], arr[j]);
         }
-        // 如果没有发生交换，说明已经有序
-        if (!swapped) {
-            break;
-        }
+    }
+    std::swap(arr[i + 1], arr[high]);
+    return i + 1;
+}
+
+// 快速排序递归函数
+void quickSort(std::vector<int>& arr, int low, int high) {
+    if (low < high) {
+        int pi = partition(arr, low, high); // 分区索引
+        quickSort(arr, low, pi - 1);        // 递归排序左半部分
+        quickSort(arr, pi + 1, high);       // 递归排序右半部分
+    }
+}
+
+// 快速排序封装函数（对外接口）
+void quickSort(std::vector<int>& arr) {
+    if (!arr.empty()) {
+        quickSort(arr, 0, arr.size() - 1);
     }
 }
 

@@ -16,7 +16,6 @@ pub enum ProgressEvent {
 }
 
 use crate::context::ContextManager;
-use crate::git::GitManager;
 use crate::llm::{LlmClient, LlmConfig};
 use crate::snapshot::SnapshotManager;
 use crate::storage::Storage;
@@ -144,7 +143,6 @@ pub struct Agent {
     session_id: Mutex<Option<String>>,
     total_usage: Mutex<Usage>,
     snapshot_manager: Option<Arc<SnapshotManager>>,
-    git_manager: Option<Arc<GitManager>>,
     progress_tx: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
 }
 
@@ -169,13 +167,7 @@ impl Agent {
             total_usage: Mutex::new(Usage::default()),
             snapshot_manager: None,
             progress_tx: None,
-            git_manager: None,
         }
-    }
-
-    pub fn with_git(mut self, path: &str) -> Self {
-        self.git_manager = GitManager::open(path).ok().map(Arc::new);
-        self
     }
 
     pub fn with_progress(mut self, tx: tokio::sync::mpsc::UnboundedSender<ProgressEvent>) -> Self {
@@ -402,7 +394,7 @@ impl Agent {
                     self.registry.get(&call.name).map(|t| t.is_modifier()).unwrap_or(false)
                 });
                 if has_modifier {
-                    if let Some(git) = &self.git_manager {
+                    if let Some(git) = crate::tools::get_git_manager() {
                         if let Err(e) = git.auto_commit("agent: snapshot before changes") {
                             warn!("Git auto-commit failed: {}", e);
                         } else {
@@ -547,7 +539,7 @@ impl Agent {
 
                 // Show git diff after tool execution
                 if has_modifier {
-                    if let Some(git) = &self.git_manager {
+                    if let Some(git) = crate::tools::get_git_manager() {
                         if let Ok(diff) = git.diff_uncommitted() {
                             if !diff.is_empty() {
                                 self.emit(ProgressEvent::DiffAvailable { diff }).await;

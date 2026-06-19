@@ -113,7 +113,29 @@ impl Storage {
             CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
             CREATE INDEX IF NOT EXISTS idx_message_parts_message_id ON message_parts(message_id);
             CREATE INDEX IF NOT EXISTS idx_tool_results_message_id ON tool_results(message_id);
-            CREATE INDEX IF NOT EXISTS idx_tool_results_tool_name ON tool_results(tool_name);",
+            CREATE TABLE IF NOT EXISTS todos (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                priority TEXT NOT NULL DEFAULT 'medium',
+                position INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS events (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                data TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_todos_session_id ON todos(session_id);
+            CREATE INDEX IF NOT EXISTS idx_tool_results_tool_name ON tool_results(tool_name);
+            CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id);
+            CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);",
         )
         .context("Failed to initialize schema")?;
 
@@ -168,6 +190,10 @@ impl Storage {
             "INSERT INTO sessions (id, title, system_prompt, model, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![id, title, system_prompt, model, now, now],
         )?;
+        conn.execute(
+            "INSERT INTO events (id, session_id, event_type, data, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), id, "session.created", "{}", now],
+        ).ok();
         Ok(id)
     }
 
@@ -272,6 +298,13 @@ impl Storage {
         let role = message.role_str();
         let conn = self.conn.lock().unwrap();
 
+        // Append event
+        let event_data = serde_json::json!({"role": role, "message_id": id});
+        conn.execute(
+            "INSERT INTO events (id, session_id, event_type, data, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), session_id, "message.added", event_data.to_string(), now],
+        ).ok();
+
         conn.execute(
             "INSERT INTO messages (id, session_id, role, created_at) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![id, session_id, role, now],
@@ -325,6 +358,11 @@ impl Storage {
                     _ => "success",
                 };
                 let result_json = serde_json::to_string(result)?;
+                let tool_event = serde_json::json!({"tool_name": tool_name, "tool_call_id": tool_call_id, "status": status});
+                conn.execute(
+                    "INSERT INTO events (id, session_id, event_type, data, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![uuid::Uuid::new_v4().to_string(), session_id, "tool.executed", tool_event.to_string(), now],
+                ).ok();
                 conn.execute(
                     "INSERT INTO tool_results (id, message_id, tool_call_id, tool_name, status, result_value, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -578,6 +616,119 @@ impl Storage {
             .collect();
         Ok(stats)
     }
+
+    // ── Event Sourcing ──
+
+    pub fn append_event(&self, session_id: &str, event_type: &str, data: &serde_json::Value) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO events (id, session_id, event_type, data, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, session_id, event_type, data.to_string(), now],
+        )?;
+        Ok(id)
+    }
+
+    pub fn get_events(&self, session_id: &str) -> Result<Vec<StoredEvent>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, event_type, data, created_at FROM events WHERE session_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let events = stmt
+            .query_map(rusqlite::params![session_id], |row| {
+                Ok(StoredEvent {
+                    id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    data: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(events)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredEvent {
+    pub id: String,
+    pub event_type: String,
+    pub data: String,
+    pub created_at: String,
+}
+
+impl Storage {
+    // ── Todo CRUD ──
+
+    pub fn create_todo(&self, session_id: &str, content: &str, priority: &str) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let max_pos: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM todos WHERE session_id = ?1",
+                rusqlite::params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        conn.execute(
+            "INSERT INTO todos (id, session_id, content, status, priority, position, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![id, session_id, content, "pending", priority, max_pos, now, now],
+        )?;
+        Ok(id)
+    }
+
+    pub fn list_todos(&self, session_id: &str) -> Result<Vec<TodoItem>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, content, status, priority, position, created_at, updated_at
+             FROM todos WHERE session_id = ?1 ORDER BY position ASC",
+        )?;
+        let items = stmt
+            .query_map(rusqlite::params![session_id], |row| {
+                Ok(TodoItem {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                    status: row.get(2)?,
+                    priority: row.get(3)?,
+                    position: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(items)
+    }
+
+    pub fn update_todo_status(&self, todo_id: &str, status: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE todos SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![status, now, todo_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_todo(&self, todo_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM todos WHERE id = ?1", rusqlite::params![todo_id])?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TodoItem {
+    pub id: String,
+    pub content: String,
+    pub status: String,
+    pub priority: String,
+    pub position: i64,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 impl Default for Storage {

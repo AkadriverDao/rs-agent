@@ -3,14 +3,24 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use serde_json::Value;
 
+use crate::git::GitManager;
 use crate::snapshot::SnapshotManager;
 use crate::tool::{Tool, ToolContext, ToolError, ToolResult};
 use crate::types::{ToolContent, ToolOutput};
 
 static SNAPSHOT_MANAGER: std::sync::OnceLock<Arc<SnapshotManager>> = std::sync::OnceLock::new();
+static GIT_MANAGER: std::sync::OnceLock<Arc<GitManager>> = std::sync::OnceLock::new();
 
 pub fn init_snapshot_manager(sm: Arc<SnapshotManager>) {
     let _ = SNAPSHOT_MANAGER.set(sm);
+}
+
+pub fn init_git_manager(gm: Arc<GitManager>) {
+    let _ = GIT_MANAGER.set(gm);
+}
+
+pub fn get_git_manager() -> Option<&'static Arc<GitManager>> {
+    GIT_MANAGER.get()
 }
 
 // ── Read Tool ──
@@ -579,6 +589,73 @@ impl Tool for WebSearchTool {
     }
 }
 
+// ── Git Tools ──
+
+pub struct GitCommitTool;
+impl Tool for GitCommitTool {
+    fn name(&self) -> &str { "git_commit" }
+    fn description(&self) -> &str { "Commit staged changes with a message." }
+    fn input_schema(&self) -> Value {
+        serde_json::json!({"type":"object","properties":{"message":{"type":"string","description":"Commit message"}},"required":["message"]})
+    }
+    fn execute(&self, input: Value, _ctx: ToolContext) -> BoxFuture<'static, ToolResult<ToolOutput>> {
+        let msg = input.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        Box::pin(async move {
+            let gm = GIT_MANAGER.get().ok_or_else(|| ToolError::Execution("Git not initialized".into()))?;
+            let hash = gm.auto_commit(&msg).map_err(|e| ToolError::Execution(e.to_string()))?;
+            Ok(ToolOutput { content: vec![ToolContent::Text { text: format!("Committed: {}", &hash[..8]) }] })
+        })
+    }
+}
+
+pub struct GitStatusTool;
+impl Tool for GitStatusTool {
+    fn name(&self) -> &str { "git_status" }
+    fn description(&self) -> &str { "Show working tree status (modified/untracked files)." }
+    fn input_schema(&self) -> Value { serde_json::json!({"type":"object","properties":{},"required":[]}) }
+    fn execute(&self, _input: Value, _ctx: ToolContext) -> BoxFuture<'static, ToolResult<ToolOutput>> {
+        Box::pin(async move {
+            let gm = GIT_MANAGER.get().ok_or_else(|| ToolError::Execution("Git not initialized".into()))?;
+            let status = gm.status().map_err(|e| ToolError::Execution(e.to_string()))?;
+            let text = if status.is_empty() { "Clean working tree".into() } else { status.join("\n") };
+            Ok(ToolOutput { content: vec![ToolContent::Text { text }] })
+        })
+    }
+}
+
+pub struct GitDiffTool;
+impl Tool for GitDiffTool {
+    fn name(&self) -> &str { "git_diff" }
+    fn description(&self) -> &str { "Show uncommitted diff." }
+    fn input_schema(&self) -> Value { serde_json::json!({"type":"object","properties":{},"required":[]}) }
+    fn execute(&self, _input: Value, _ctx: ToolContext) -> BoxFuture<'static, ToolResult<ToolOutput>> {
+        Box::pin(async move {
+            let gm = GIT_MANAGER.get().ok_or_else(|| ToolError::Execution("Git not initialized".into()))?;
+            let diff = gm.diff_uncommitted().map_err(|e| ToolError::Execution(e.to_string()))?;
+            let text = if diff.is_empty() { "No changes".into() } else { diff };
+            Ok(ToolOutput { content: vec![ToolContent::Text { text }] })
+        })
+    }
+}
+
+pub struct GitLogTool;
+impl Tool for GitLogTool {
+    fn name(&self) -> &str { "git_log" }
+    fn description(&self) -> &str { "Show recent commit history." }
+    fn input_schema(&self) -> Value {
+        serde_json::json!({"type":"object","properties":{"count":{"type":"number","description":"Number of commits (default 5)"}},"required":[]})
+    }
+    fn execute(&self, input: Value, _ctx: ToolContext) -> BoxFuture<'static, ToolResult<ToolOutput>> {
+        let count = input.get("count").and_then(|v| v.as_u64()).unwrap_or(5).min(20) as usize;
+        Box::pin(async move {
+            let gm = GIT_MANAGER.get().ok_or_else(|| ToolError::Execution("Git not initialized".into()))?;
+            let log = gm.log(count).map_err(|e| ToolError::Execution(e.to_string()))?;
+            let text = if log.is_empty() { "No commits yet".into() } else { log.join("\n") };
+            Ok(ToolOutput { content: vec![ToolContent::Text { text }] })
+        })
+    }
+}
+
 // ── Undo Tool ──
 
 pub struct UndoTool;
@@ -646,5 +723,9 @@ pub fn all_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(WebFetchTool),
         Arc::new(WebSearchTool),
         Arc::new(UndoTool),
+        Arc::new(GitCommitTool),
+        Arc::new(GitStatusTool),
+        Arc::new(GitDiffTool),
+        Arc::new(GitLogTool),
     ]
 }

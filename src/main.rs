@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_engine::agent::ProgressEvent;
+use agent_engine::git::GitManager;
 use agent_engine::prelude::*;
 use agent_engine::tools;
 use agent_engine::tui::{self, AppState};
@@ -41,6 +42,7 @@ fn build_registry(kind: AgentKind, storage: &Arc<Storage>, session_id: &str) -> 
         for name in &[
             "read", "write", "edit", "glob", "grep", "bash",
             "webfetch", "websearch", "undo",
+            "git_commit", "git_status", "git_diff", "git_log",
         ] {
             c = c.allow_tool(name);
         }
@@ -117,6 +119,12 @@ async fn main() -> Result<(), anyhow::Error> {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| ".".to_string());
 
+    // Init git globally for tools
+    if let Ok(gm) = GitManager::open(&agent_cwd) {
+        let gm = Arc::new(gm);
+        tools::init_git_manager(gm.clone());
+    }
+
     let agent = Arc::new(
         Agent::new(
             AgentConfig {
@@ -130,7 +138,6 @@ async fn main() -> Result<(), anyhow::Error> {
             registry,
         )
         .with_progress(progress_tx)
-        .with_git(&agent_cwd)
         .with_storage(storage.clone(), session_id.clone())
         .await,
     );

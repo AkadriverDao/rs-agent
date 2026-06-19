@@ -104,8 +104,19 @@
 - `PermissionChecker::from_agent()` 根据模式配置权限 ✅
 - 启动时选择、运行中用 `/agent build|plan|general` 切换 ✅
 
-### [ ] Git 集成
-- commit, PR, branch 操作工具
+### [x] Git 集成
+- `git_commit` — 自动 commit 变更 ✅
+- `git_status` — 查看工作区状态 ✅
+- `git_diff` — 查看未提交的 diff ✅
+- `git_log` — 查看提交历史 ✅
+- write/edit 前自动 `git add -A && commit` ✅
+- 修改后自动 `git diff` 展示变更 ✅
+
+### [x] Event Sourcing
+- `events` 表记录所有关键操作 ✅
+- 事件类型: `session.created` / `message.added` / `tool.executed` ✅
+- `append_event()` / `get_events()` 方法 ✅
+- 每次 `save_message()` 和工具执行时自动记录事件 ✅
 
 ### [ ] MCP 服务器支持
 - 通过 Model Context Protocol 接入外部工具生态

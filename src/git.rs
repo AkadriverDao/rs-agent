@@ -95,6 +95,21 @@ impl GitManager {
         Ok(result)
     }
 
+    pub fn log(&self, count: usize) -> Result<Vec<String>> {
+        let repo = self.repo.lock().unwrap();
+        let mut revwalk = repo.revwalk()?;
+        revwalk.push_head()?;
+        let mut entries = Vec::new();
+        for (i, oid) in revwalk.enumerate() {
+            if i >= count { break; }
+            let oid = oid?;
+            let commit = repo.find_commit(oid)?;
+            let msg = commit.message().unwrap_or("").lines().next().unwrap_or("").to_string();
+            entries.push(format!("{} {}", &commit.id().to_string()[..8], msg));
+        }
+        Ok(entries)
+    }
+
     pub fn undo(&self) -> Result<String> {
         let repo = self.repo.lock().unwrap();
         let head = last_commit(&repo)?;

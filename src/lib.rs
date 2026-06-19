@@ -17,7 +17,7 @@ pub mod prelude {
     pub use crate::permission::{
         Approver, DefaultPermissionChecker, PermissionChecker, PermissionLevel, PermissionRule,
     };
-    pub use crate::storage::{SessionInfo, Storage};
+    pub use crate::storage::{SessionInfo, Storage, StoredEvent};
     pub use crate::tool::{Tool, ToolBuilder, ToolContext, ToolError, ToolRegistry, ToolResult};
     pub use crate::types::{ToolContent, ToolOutput};
     pub use crate::types::*;

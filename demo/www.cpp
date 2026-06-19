@@ -34,7 +34,7 @@ int main() {
     std::cout << "排序前: ";
     printArray(arr);
 
-    quickSort(arr);
+    bubbleSort(arr);
 
     std::cout << "排序后: ";
     printArray(arr);

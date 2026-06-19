@@ -167,10 +167,14 @@ impl Tool for EditTool {
                         Err(e) => Err(ToolError::Execution(format!("Write error: {}", e))),
                     }
                 }
-                None => Err(ToolError::Execution(format!(
-                    "Could not find old string in {}",
-                    path
-                ))),
+                None => {
+                    // Show context around where it failed
+                    let preview = content.lines().take(5).collect::<Vec<_>>().join("\n");
+                    Err(ToolError::Execution(format!(
+                        "Could not find the specified text in {}. First 5 lines of file:\n{}",
+                        path, preview
+                    )))
+                }
             }
         })
     }

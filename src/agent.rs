@@ -236,6 +236,7 @@ impl Agent {
     async fn run_loop(&self) -> Result<AgentOutput, anyhow::Error> {
         let mut iteration = 0u32;
         let mut sterile_rounds = 0u32;
+        let mut tool_error_rounds = 0u32;
         const MAX_STERILE_ROUNDS: u32 = 6;
 
         let mut tool_call_results: Vec<(String, String, ToolResultValue)> = Vec::new();
@@ -510,6 +511,29 @@ impl Agent {
                             tool_call_results.push((call.id.clone(), call.name.clone(), err_val));
                         }
                     }
+                }
+
+                // Track consecutive tool error rounds
+                let all_errored = results.iter().all(|(_, r)| r.is_err());
+                if all_errored {
+                    tool_error_rounds += 1;
+                    if tool_error_rounds >= 3 {
+                        error!("All tools failed for 3 consecutive rounds, aborting");
+                        drop(ctx);
+                        return Ok(AgentOutput {
+                            text: format!(
+                                "I encountered repeated errors and couldn't make progress after {} attempts.",
+                                tool_error_rounds
+                            ),
+                            reasoning: None,
+                            tool_calls: Vec::new(),
+                            tool_results: tool_call_results,
+                            finish_reason: FinishReason::Error,
+                            usage: Some(self.total_usage.lock().await.clone()),
+                        });
+                    }
+                } else {
+                    tool_error_rounds = 0;
                 }
 
                 self.emit(ProgressEvent::StepFinished {

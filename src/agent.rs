@@ -381,11 +381,13 @@ impl Agent {
                 debug!("Executing {} tool calls...", pending_tool_calls.len());
 
                 for call in &pending_tool_calls {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
                     let max = if call.name == "write" { 200 } else { 80 };
                     let input = summarize_value(&call.input, max);
                     self.emit(ProgressEvent::ToolCallStarted {
                         name: call.name.clone(),
                         input,
+                        ts: now_ms,
                     }).await;
                 }
 
@@ -400,10 +402,12 @@ impl Agent {
                         } else {
                             // Show current status
                             if let Ok(status) = git.status() {
+                                let git_ts = chrono::Utc::now().timestamp_millis();
                                 for s in &status {
                                     self.emit(ProgressEvent::ToolCallStarted {
                                         name: "git status".into(),
                                         input: s.clone(),
+                                        ts: git_ts,
                                     }).await;
                                 }
                             }
@@ -469,6 +473,7 @@ impl Agent {
                                 name: call.name.clone(),
                                 status: "done".into(),
                                 error: None,
+                                ts: chrono::Utc::now().timestamp_millis(),
                             }).await;
                             tool_call_results.push((
                                 call.id.clone(),
@@ -489,6 +494,7 @@ impl Agent {
                                 name: call.name.clone(),
                                 status: "error".into(),
                                 error: Some(e.to_string()),
+                                ts: chrono::Utc::now().timestamp_millis(),
                             }).await;
                             let sid = self.session_id.lock().await.clone();
                             if let (Some(storage), Some(ref session_id)) =

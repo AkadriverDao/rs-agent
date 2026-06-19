@@ -282,6 +282,20 @@ fn handle_progress_event(state: &mut AppState, ev: &ProgressEvent) {
         ProgressEvent::Token { text } => {
             state.streaming_text.push_str(text);
         }
+        ProgressEvent::ToolCallStarted { name, input, ts } => {
+            state.tool_starts.insert(name.clone(), *ts);
+            let s = format_tool_start(name, input);
+            if !s.is_empty() {
+                state.live_events.push(s);
+            }
+        }
+        ProgressEvent::ToolCallFinished { name, status, error, ts } => {
+            let duration = state.tool_starts.remove(name).map(|start| *ts - start);
+            let s = format_tool_end(name, status, error, duration);
+            if !s.is_empty() {
+                state.live_events.push(s);
+            }
+        }
         _ => {
             let s = event_to_string(ev);
             for line in s.lines() {
@@ -293,11 +307,51 @@ fn handle_progress_event(state: &mut AppState, ev: &ProgressEvent) {
     }
 }
 
+fn format_tool_start(name: &str, input: &str) -> String {
+    let arrow = match name {
+        "read" => "→",
+        "write" | "edit" => "←",
+        "bash" => "$",
+        "glob" | "grep" => "✱",
+        "webfetch" | "websearch" => "🌐",
+        "undo" => "↩",
+        _ => "→",
+    };
+    // Extract path or command from input for cleaner display
+    let summary = if name == "bash" {
+        input.trim().trim_matches('"').to_string()
+    } else if let Some(path) = input.split("\"path\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+    {
+        path.to_string()
+    } else {
+        let trimmed = input.trim().trim_matches('"');
+        if trimmed.len() > 60 {
+            format!("{}...", &trimmed[..60])
+        } else {
+            trimmed.to_string()
+        }
+    };
+    format!("{} {} {}", arrow, name, summary)
+}
+
+fn format_tool_end(name: &str, status: &str, error: &Option<String>, duration: Option<i64>) -> String {
+    let ms = duration.map(|d| format!("+{}ms", d)).unwrap_or_default();
+    if status == "error" {
+        let msg = error.as_deref().unwrap_or("failed");
+        let short = if msg.len() > 60 { format!("{}...", &msg[..60]) } else { msg.to_string() };
+        format!("  ✗ {} — {} ({})", name, short, ms)
+    } else {
+        String::new() // success is shown by the start line
+    }
+}
+
 fn event_to_string(ev: &ProgressEvent) -> String {
     match ev {
         ProgressEvent::Token { .. } => unreachable!(),
         ProgressEvent::LlmCall { .. } => String::new(),
-        ProgressEvent::ToolCallStarted { name, input } => {
+        ProgressEvent::ToolCallStarted { name, input, .. } => {
             let arrow = match name.as_str() {
                 "read" => "→",
                 "write" | "edit" => "←",
@@ -309,20 +363,6 @@ fn event_to_string(ev: &ProgressEvent) -> String {
                 _ => "→",
             };
             format!("{} {} {}", arrow, name, input)
-        }
-        ProgressEvent::ToolCallFinished { name, status, error } => {
-            if status == "error" {
-                let msg = error.as_deref().unwrap_or("unknown error");
-                let preview = msg.lines().next().unwrap_or(msg);
-                let short = if preview.len() > 60 {
-                    format!("{}...", &preview[..60])
-                } else {
-                    preview.to_string()
-                };
-                format!("✗ {} {}", name, short)
-            } else {
-                String::new()
-            }
         }
         ProgressEvent::DiffAvailable { diff } => {
             let mut s = String::new();

@@ -28,6 +28,7 @@ pub struct AppState {
     pub spinner: u64,
     pub live_events: Vec<String>,
     pub streaming_text: String,
+    pub tool_starts: std::collections::HashMap<String, i64>,
 }
 
 impl AppState {
@@ -41,6 +42,7 @@ impl AppState {
             spinner: 0,
             live_events: Vec::new(),
             streaming_text: String::new(),
+            tool_starts: std::collections::HashMap::new(),
         }
     }
 

@@ -327,11 +327,7 @@ fn format_tool_start(name: &str, input: &str) -> String {
         path.to_string()
     } else {
         let trimmed = input.trim().trim_matches('"');
-        if trimmed.len() > 60 {
-            format!("{}...", &trimmed[..60])
-        } else {
-            trimmed.to_string()
-        }
+        truncate_utf8(trimmed, 60)
     };
     format!("{} {} {}", arrow, name, summary)
 }
@@ -345,6 +341,17 @@ fn format_tool_end(name: &str, status: &str, error: &Option<String>, duration: O
     } else {
         String::new() // success is shown by the start line
     }
+}
+
+fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
 }
 
 fn event_to_string(ev: &ProgressEvent) -> String {

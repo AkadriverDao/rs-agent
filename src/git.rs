@@ -52,7 +52,7 @@ impl GitManager {
 
     pub fn diff_uncommitted(&self) -> Result<String> {
         let repo = self.repo.lock().unwrap();
-        let head = self.last_commit();
+        let head = last_commit(&repo);
         let tree = match &head {
             Ok(c) => c.tree().ok(),
             Err(_) => None,
@@ -65,7 +65,9 @@ impl GitManager {
 
         // Diff tracked files
         if let Ok(diff) = repo.diff_tree_to_workdir(tree.as_ref(), Some(&mut opts)) {
-            output.push_str(&format_diff(&diff));
+            if let Ok(d) = format_diff(&diff) {
+                output.push_str(&d);
+            }
         }
 
         // Show untracked files (new files not yet tracked by git)

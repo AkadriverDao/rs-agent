@@ -213,20 +213,10 @@ async fn main() -> Result<(), anyhow::Error> {
                         tokio::select! {
                             ev = progress_rx.recv() => {
                                 if let Some(ev) = ev {
-                                    let s = event_to_string(&ev);
-                                    for line in s.lines() {
-                                        if !line.is_empty() {
-                                            state.live_events.push(line.to_string());
-                                        }
-                                    }
+                                    handle_progress_event(&mut state, &ev);
                                 }
                                 while let Ok(ev) = progress_rx.try_recv() {
-                                    let s = event_to_string(&ev);
-                                    for line in s.lines() {
-                                        if !line.is_empty() {
-                                            state.live_events.push(line.to_string());
-                                        }
-                                    }
+                                    handle_progress_event(&mut state, &ev);
                                 }
                                 state.spinner += 1;
                                 terminal.draw(|f| tui::draw(f, &state))?;
@@ -280,8 +270,25 @@ async fn main() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+fn handle_progress_event(state: &mut AppState, ev: &ProgressEvent) {
+    match ev {
+        ProgressEvent::Token { text } => {
+            state.streaming_text.push_str(text);
+        }
+        _ => {
+            let s = event_to_string(ev);
+            for line in s.lines() {
+                if !line.is_empty() {
+                    state.live_events.push(line.to_string());
+                }
+            }
+        }
+    }
+}
+
 fn event_to_string(ev: &ProgressEvent) -> String {
     match ev {
+        ProgressEvent::Token { .. } => unreachable!(),
         ProgressEvent::LlmCall { .. } => String::new(),
         ProgressEvent::ToolCallStarted { name, input } => {
             let arrow = match name.as_str() {
@@ -296,11 +303,18 @@ fn event_to_string(ev: &ProgressEvent) -> String {
             };
             format!("{} {} {}", arrow, name, input)
         }
-        ProgressEvent::ToolCallFinished { name, status } => {
+        ProgressEvent::ToolCallFinished { name, status, error } => {
             if status == "error" {
-                format!("✗ {} failed", name)
+                let msg = error.as_deref().unwrap_or("unknown error");
+                let preview = msg.lines().next().unwrap_or(msg);
+                let short = if preview.len() > 60 {
+                    format!("{}...", &preview[..60])
+                } else {
+                    preview.to_string()
+                };
+                format!("✗ {} {}", name, short)
             } else {
-                String::new() // success is implied by the start line
+                String::new()
             }
         }
         ProgressEvent::DiffAvailable { diff } => {

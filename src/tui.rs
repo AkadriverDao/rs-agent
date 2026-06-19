@@ -27,6 +27,7 @@ pub struct AppState {
     pub thinking: bool,
     pub spinner: u64,
     pub live_events: Vec<String>,
+    pub streaming_text: String,
 }
 
 impl AppState {
@@ -39,6 +40,7 @@ impl AppState {
             thinking: false,
             spinner: 0,
             live_events: Vec::new(),
+            streaming_text: String::new(),
         }
     }
 
@@ -85,7 +87,7 @@ impl AppState {
         });
         self.scroll = usize::MAX;
         self.thinking = false;
-        // Keep live_events — execution history stays visible
+        self.streaming_text.clear();
     }
 }
 
@@ -176,6 +178,18 @@ fn draw_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppStat
             }
             _ => {}
         }
+    }
+
+    // Show streaming response text while generating
+    if state.thinking && !state.streaming_text.is_empty() {
+        let preview = truncate(&state.streaming_text, 400);
+        for line in preview.lines() {
+            lines.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::White),
+            )));
+        }
+        lines.push(Line::from(""));
     }
 
     // Execution flow — shown during and after execution

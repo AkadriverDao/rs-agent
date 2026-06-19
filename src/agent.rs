@@ -7,8 +7,9 @@ use tracing::{debug, error, info, warn};
 #[derive(Debug, Clone)]
 pub enum ProgressEvent {
     LlmCall { iteration: u32 },
+    Token { text: String },
     ToolCallStarted { name: String, input: String },
-    ToolCallFinished { name: String, status: String },
+    ToolCallFinished { name: String, status: String, error: Option<String> },
     StepFinished { iteration: u32, tool_count: usize },
     DiffAvailable { diff: String },
     Done { text_len: usize, tool_count: usize },
@@ -287,7 +288,7 @@ impl Agent {
                 match event {
                     LlmEvent::TextDelta { text, .. } => {
                         collected_text.push_str(&text);
-                        debug!("Text delta: {} chars", text.len());
+                        self.emit(ProgressEvent::Token { text }).await;
                     }
                     LlmEvent::ReasoningDelta { text, .. } => {
                         collected_reasoning.push_str(&text);
@@ -474,6 +475,7 @@ impl Agent {
                             self.emit(ProgressEvent::ToolCallFinished {
                                 name: call.name.clone(),
                                 status: "done".into(),
+                                error: None,
                             }).await;
                             tool_call_results.push((
                                 call.id.clone(),
@@ -493,6 +495,7 @@ impl Agent {
                             self.emit(ProgressEvent::ToolCallFinished {
                                 name: call.name.clone(),
                                 status: "error".into(),
+                                error: Some(e.to_string()),
                             }).await;
                             let sid = self.session_id.lock().await.clone();
                             if let (Some(storage), Some(ref session_id)) =

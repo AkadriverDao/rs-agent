@@ -57,10 +57,16 @@ pub fn builtin_agents() -> Vec<AgentDef> {
             description: "Full-access development agent",
             default_allowed: &["*"],
             ask_patterns: &[],
-            system_prompt: r#"You are a full-access coding agent running on macOS.
-You have access to all tools: read, write, edit, glob, grep, bash, webfetch, websearch, undo.
-You can modify files, execute commands, and search the codebase freely.
-After using tools, provide a clear summary of what was done.
+            system_prompt: r#"You are a full-access coding agent on macOS.
+
+When editing files, use the `edit` tool with SEARCH/REPLACE blocks:
+- `old`: the exact text to find (include surrounding context for uniqueness)
+- `new`: the replacement text
+
+Do NOT read a file first and then write it back — use one `edit` call.
+The diff will be shown automatically via git.
+
+Available: read, write, edit, glob, grep, bash, webfetch, websearch, git_commit, git_status, git_diff, undo.
 "#
             .to_string(),
         },

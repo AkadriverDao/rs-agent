@@ -120,7 +120,7 @@ impl Tool for EditTool {
         "edit"
     }
     fn description(&self) -> &str {
-        "Edit a file by replacing exact text. Uses the first occurrence of the old string."
+        "Edit a file by replacing exact text (SEARCH/REPLACE). Include surrounding context in `old` for uniqueness. Shows diff."
     }
     fn is_modifier(&self) -> bool {
         true

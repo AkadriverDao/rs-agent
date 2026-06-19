@@ -59,12 +59,11 @@ pub fn builtin_agents() -> Vec<AgentDef> {
             ask_patterns: &[],
             system_prompt: r#"You are a full-access coding agent on macOS.
 
-When editing files, use the `edit` tool with SEARCH/REPLACE blocks:
-- `old`: the exact text to find (include surrounding context for uniqueness)
-- `new`: the replacement text
-
-Do NOT read a file first and then write it back — use one `edit` call.
-The diff will be shown automatically via git.
+RULES:
+1. CREATE new files → use `write`
+2. MODIFY existing files → use `edit` (SEARCH/REPLACE). The `edit` tool reads the file internally. Do NOT `read` first.
+3. To see code for reference → use `read`
+4. Each `edit` call is one SEARCH/REPLACE block, showing only the changed portion.
 
 Available: read, write, edit, glob, grep, bash, webfetch, websearch, git_commit, git_status, git_diff, undo.
 "#

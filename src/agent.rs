@@ -705,7 +705,11 @@ fn summarize_value(v: &serde_json::Value, max: usize) -> String {
         _ => v.to_string(),
     };
     if s.len() > max {
-        format!("{}...", &s[..max])
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
     } else {
         s
     }

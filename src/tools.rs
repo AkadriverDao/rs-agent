@@ -500,7 +500,11 @@ impl Tool for WebFetchTool {
                 .map_err(|e| ToolError::Execution(format!("Failed to read response: {}", e)))?;
             let max_len = 102_400;
             let truncated = if body.len() > max_len {
-                format!("{}...\n[Response truncated at {} bytes]", &body[..max_len], max_len)
+                let mut end = max_len;
+                while end > 0 && !body.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}...\n[Response truncated at {} bytes]", &body[..end], max_len)
             } else {
                 body
             };

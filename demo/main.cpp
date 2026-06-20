@@ -1,4 +1,33 @@
 #include <iostream>
+#include <vector>
+#include <queue>
+
+// BFS: Breadth-First Search on a graph represented as adjacency list
+// graph: adjacency list, start: starting node index
+void bfs(const std::vector<std::vector<int>>& graph, int start) {
+    int n = graph.size();
+    std::vector<bool> visited(n, false);
+    std::queue<int> q;
+
+    visited[start] = true;
+    q.push(start);
+
+    std::cout << "BFS traversal starting from node " << start << ": ";
+
+    while (!q.empty()) {
+        int node = q.front();
+        q.pop();
+        std::cout << node << " ";
+
+        for (int neighbor : graph[node]) {
+            if (!visited[neighbor]) {
+                visited[neighbor] = true;
+                q.push(neighbor);
+            }
+        }
+    }
+    std::cout << std::endl;
+}
 
 int partition(int arr[], int low, int high) {
     int pivot = arr[high];

@@ -443,7 +443,7 @@ async fn handle_slash_command(
                 "Thinking blocks hidden."
             });
         }
-        "/new" | "/clear" => {
+        "/new" => {
             let def = agent_def_for(*current_kind);
             let id = storage.create_session("New Session", &def.system_prompt, "deepseek-chat")?;
             *session_id = id.clone();
@@ -463,6 +463,18 @@ async fn handle_slash_command(
                 id
             };
             state.add_system_message("New session.");
+        }
+        "/clear" => {
+            // Clear the terminal screen (like shell's clear command)
+            use std::io::Write;
+            write!(
+                std::io::stdout(),
+                "{}{}",
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                crossterm::cursor::MoveTo(0, 0),
+            )?;
+            std::io::stdout().flush()?;
+            state.add_system_message("Screen cleared.");
         }
         "/agent" => {
             let name = parts.get(1).copied().unwrap_or("");

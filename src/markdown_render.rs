@@ -258,7 +258,7 @@ fn render_list_item(out: &mut Vec<Line>, ordered: Option<u32>, text: &str, width
     }
 }
 
-fn render_code_block(lang: &Option<String>, lines: &[String], out: &mut Vec<Line>, max_width: u16) {
+pub fn render_code_block(lang: &Option<String>, lines: &[String], out: &mut Vec<Line>, max_width: u16) {
     let label = lang
         .as_deref()
         .filter(|l| !l.is_empty())
@@ -644,14 +644,6 @@ fn parse_link_prefix(text: &str) -> Option<(ParsedLink, usize)> {
 
 fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
-}
-
-fn pad_display(s: &str, target: usize) -> String {
-    let w = display_width(s);
-    if w >= target {
-        return truncate_display(s, target);
-    }
-    format!("{s}{}", " ".repeat(target - w))
 }
 
 fn truncate_display(s: &str, max_width: usize) -> String {

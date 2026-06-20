@@ -502,11 +502,30 @@ impl Agent {
                                     call.input.get("path").and_then(|v| v.as_str()),
                                     call.input.get("content").and_then(|v| v.as_str()),
                                 ) {
+                                    let display_path = crate::tools::resolve_tool_path(path)
+                                        .map(|p| p.display().to_string())
+                                        .unwrap_or_else(|_| path.to_string());
                                     self.emit(ProgressEvent::ContentWritten {
-                                        path: path.to_string(),
+                                        path: display_path,
                                         content: content.to_string(),
                                     })
                                     .await;
+                                }
+                            } else if call.name == "edit" {
+                                if let Some(path) =
+                                    call.input.get("path").and_then(|v| v.as_str())
+                                {
+                                    if let Ok(resolved) = crate::tools::resolve_tool_path(path) {
+                                        if let Ok(content) =
+                                            tokio::fs::read_to_string(&resolved).await
+                                        {
+                                            self.emit(ProgressEvent::ContentWritten {
+                                                path: resolved.display().to_string(),
+                                                content,
+                                            })
+                                            .await;
+                                        }
+                                    }
                                 }
                             }
                             tool_call_results.push((
@@ -576,17 +595,6 @@ impl Agent {
                     iteration,
                     tool_count: pending_tool_calls.len(),
                 }).await;
-
-                // Show git diff after tool execution
-                if has_modifier {
-                    if let Some(git) = crate::tools::get_git_manager() {
-                        if let Ok(diff) = git.diff_uncommitted() {
-                            if !diff.is_empty() {
-                                self.emit(ProgressEvent::DiffAvailable { diff }).await;
-                            }
-                        }
-                    }
-                }
 
                 drop(ctx);
                 continue;

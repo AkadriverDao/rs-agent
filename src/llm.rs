@@ -101,7 +101,7 @@ struct DeltaToolCall {
     index: u64,
     id: Option<String>,
     #[serde(rename = "type")]
-    type_: Option<String>,
+    _type: Option<String>,
     function: Option<DeltaFunction>,
 }
 

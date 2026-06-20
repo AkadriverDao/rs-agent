@@ -12,7 +12,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::agent::{AgentOutput, ProgressEvent};
-use crate::markdown_render::render_markdown;
+use crate::markdown_render::{render_code_block, render_markdown};
 use crate::types::{ContentPart, Message, ToolResultValue};
 
 // ── Turn timeline (OpenCode-style chronological blocks) ──
@@ -113,39 +113,42 @@ impl ActiveTurn {
     }
 
     fn push_written_file(&mut self, path: &str, content: &str) {
-        const MAX_LINES: usize = 100;
-        let lines: Vec<&str> = content.lines().collect();
-        let preview = if lines.len() > MAX_LINES {
-            format!(
-                "{}\n… ({} more lines)",
-                lines[..MAX_LINES].join("\n"),
-                lines.len() - MAX_LINES
-            )
-        } else {
-            content.to_string()
-        };
-        self.items.push(TurnItem::WrittenFile {
+        let item = TurnItem::WrittenFile {
             path: path.to_string(),
-            content: preview,
-        });
+            content: content.to_string(),
+        };
+        if let Some(idx) = self.items.iter().rposition(|i| {
+            matches!(i, TurnItem::WrittenFile { path: p, .. } if p == path)
+        }) {
+            self.items[idx] = item;
+        } else {
+            self.items.push(item);
+        }
     }
 
     fn push_diff(&mut self, diff: &str) {
+        const MAX_LINES: usize = 200;
+        let all: Vec<&str> = diff.lines().collect();
         let mut lines = Vec::new();
-        for line in diff.lines().take(40) {
+        for line in all.iter().take(MAX_LINES) {
             if line.starts_with("+++") || line.starts_with("---") {
                 continue;
             }
-            if line.starts_with('+') {
-                lines.push(format!("+{}", &line[1..]));
-            } else if line.starts_with('-') {
-                lines.push(format!("-{}", &line[1..]));
+            if let Some(rest) = line.strip_prefix('+') {
+                lines.push(format!("+{rest}"));
+            } else if let Some(rest) = line.strip_prefix('-') {
+                lines.push(format!("-{rest}"));
+            } else if let Some(rest) = line.strip_prefix(' ') {
+                // Context lines — required for readable code structure
+                lines.push(format!(" {rest}"));
             } else if line.starts_with("@@") {
-                lines.push(format!("~{}", line));
+                lines.push(format!("~{line}"));
+            } else if line.starts_with('\\') {
+                lines.push(format!(" {line}"));
             }
         }
-        if diff.lines().count() > 40 {
-            lines.push("…".into());
+        if all.len() > MAX_LINES {
+            lines.push(format!("… ({} more diff lines)", all.len() - MAX_LINES));
         }
         if !lines.is_empty() {
             self.items.push(TurnItem::Diff { lines });
@@ -858,10 +861,11 @@ fn draw_messages(frame: &mut Frame, area: Rect, state: &mut AppState) {
     }
 
     let scroll = resolve_scroll(state.scroll, max_scroll);
+    let scroll_row = scroll.min(u16::MAX as usize) as u16;
 
     // Lines are pre-wrapped to terminal width; do not wrap again or scroll offsets drift.
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).scroll((scroll as u16, 0)),
+        Paragraph::new(Text::from(lines)).scroll((scroll_row, 0)),
         area,
     );
 }
@@ -977,14 +981,13 @@ fn render_turn_items(items: &[TurnItem], lines: &mut Vec<Line>, width: u16, show
                 let lang = std::path::Path::new(path)
                     .extension()
                     .and_then(|e| e.to_str())
-                    .map(language_from_ext)
-                    .unwrap_or("");
-                let fence = if lang.is_empty() {
-                    format!("```\n{content}\n```")
-                } else {
-                    format!("```{lang}\n{content}\n```")
-                };
-                render_markdown(&fence, lines, width);
+                    .map(|ext| language_from_ext(ext).to_string());
+                render_code_block(
+                    &lang,
+                    &content.lines().map(|l| l.to_string()).collect::<Vec<_>>(),
+                    lines,
+                    width,
+                );
             }
             TurnItem::Reasoning(r) if show_reasoning && !r.is_empty() => {
                 lines.push(Line::from(Span::styled(
@@ -1044,6 +1047,8 @@ fn styled_diff_line(line: &str) -> Line<'static> {
         (Color::Red, format!("  │ -{}", &line[1..]))
     } else if line.starts_with('~') {
         (Color::Yellow, format!("  │ {}", line))
+    } else if line.starts_with(' ') {
+        (Color::DarkGray, format!("  │ {}", &line[1..]))
     } else {
         (Color::DarkGray, format!("  │ {}", line))
     };
@@ -1151,14 +1156,23 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         "ready"
     };
+    let scroll_pos = resolve_scroll(state.scroll, state.max_scroll);
+    let scroll_hint = if state.max_scroll == 0 {
+        String::new()
+    } else if state.scroll == usize::MAX {
+        " · bottom".to_string()
+    } else {
+        format!(" · scroll {scroll_pos}/{}", state.max_scroll)
+    };
     let s = format!(
-        " {} {} · {} · {}↑{}↓{} · {} · {}",
+        " {} {} · {} · {}↑{}↓{}{} · {} · {} · PgUp/Dn",
         ch,
         state.agent_kind,
         state.model,
         state.usage_in,
         state.usage_out,
         cache,
+        scroll_hint,
         state.session_label,
         phase,
     );

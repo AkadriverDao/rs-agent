@@ -1111,15 +1111,15 @@ fn render_tool_line(t: &ToolLine) -> Line<'static> {
 
 fn styled_diff_line(line: &str) -> Line<'static> {
     let (style, text) = if line.starts_with('+') {
-        (theme::success(), format!("  │ +{}", &line[1..]))
+        (theme::success(), format!("  │ {}", line))
     } else if line.starts_with('-') {
-        (theme::error(), format!("  │ -{}", &line[1..]))
+        (theme::error(), format!("  │ {}", line))
     } else if line.starts_with('~') {
-        (Style::default().fg(Color::Yellow), format!("  │ {line}"))
+        (Style::default().fg(Color::Yellow), format!("  │ {}", &line[1..]))
     } else if line.starts_with(' ') {
         (theme::muted(), format!("  │ {}", &line[1..]))
     } else {
-        (theme::muted(), format!("  │ {line}"))
+        (theme::muted(), format!("  │ {}", line))
     };
     Line::from(Span::styled(text, style))
 }

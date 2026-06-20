@@ -165,28 +165,73 @@ async fn run_app(
             (id, Vec::new())
         };
 
-    let api_key = match std::env::var("DEEPSEEK_API_KEY") {
-        Ok(key) => key,
-        Err(_) => {
-            loop {
-                terminal.draw(|f| {
-                    tui::draw_boot(
-                        f,
-                        "DEEPSEEK_API_KEY is not set.\n\n\
-                         export DEEPSEEK_API_KEY=sk-…\n\
-                         cargo run\n\n\
-                         Press Esc to quit.",
-                    )
-                })?;
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
-                        break;
+    let config = agent_engine::config::load().unwrap_or_default();
+    let mut api_key = config.api_key.clone().or_else(|| std::env::var("DEEPSEEK_API_KEY").ok());
+
+    if api_key.is_none() {
+        let mut entered_key = String::new();
+        loop {
+            terminal.draw(|f| {
+                tui::draw_boot(
+                    f,
+                    "DEEPSEEK_API_KEY is not set.\n\n\
+                     export DEEPSEEK_API_KEY=sk-…\n\
+                     cargo run\n\n\
+                     Or press `k` to enter an API key (persisted).\n\
+                     Press Esc to quit.",
+                )
+            })?;
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Esc => break,
+                        KeyCode::Char('k') => {
+                            entered_key.clear();
+                            loop {
+                                terminal.draw(|f| {
+                                    tui::draw_boot(
+                                        f,
+                                        &format!("Enter your DeepSeek API key:\n\n{entered_key}\n\nPress Enter to confirm, Esc to cancel"),
+                                    )
+                                })?;
+                                if let Event::Key(k) = event::read()? {
+                                    if k.kind == KeyEventKind::Press {
+                                        match k.code {
+                                            KeyCode::Enter => {
+                                                let trimmed = entered_key.trim().to_string();
+                                                if !trimmed.is_empty() {
+                                                    let cfg = agent_engine::config::AppConfig {
+                                                        api_key: Some(trimmed.clone()),
+                                                    };
+                                                    let _ = agent_engine::config::save(&cfg);
+                                                    entered_key = trimmed;
+                                                    break;
+                                                }
+                                            }
+                                            KeyCode::Esc => { entered_key.clear(); break; }
+                                            KeyCode::Char(c) => entered_key.push(c),
+                                            KeyCode::Backspace => { entered_key.pop(); }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                            if !entered_key.is_empty() {
+                                break;
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
+        }
+        if entered_key.is_empty() {
             return Ok(());
         }
-    };
+        api_key = Some(entered_key);
+    }
+
+    let mut api_key = api_key.unwrap();
 
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ProgressEvent>();
     let (permission_bridge, permission_rx) = PermissionBridge::pair();
@@ -273,6 +318,39 @@ async fn run_app(
                         }
 
                         if input.starts_with('/') {
+                            if input.starts_with("/apikey") {
+                                let parts: Vec<&str> = input.split_whitespace().collect();
+                                if let Some(key) = parts.get(1) {
+                                    let key = key.to_string();
+                                    let cfg = agent_engine::config::AppConfig {
+                                        api_key: Some(key.clone()),
+                                    };
+                                    let _ = agent_engine::config::save(&cfg);
+                                    api_key = key;
+                                    let def = agent_def_for(current_kind);
+                                    let id = storage.create_session("New Session", &def.system_prompt, "deepseek-chat")?;
+                                    session_id = id.clone();
+                                    agent = create_agent(
+                                        current_kind,
+                                        storage.clone(),
+                                        id.clone(),
+                                        &api_key,
+                                        progress_tx.clone(),
+                                        Some(permission_bridge.clone()),
+                                    )
+                                    .await;
+                                    state.clear_conversation();
+                                    state.session_label = if id.len() > 8 {
+                                        id[..8].to_string()
+                                    } else {
+                                        id
+                                    };
+                                    state.add_system_message("API key updated and persisted.");
+                                } else {
+                                    state.add_system_message("Usage: /apikey sk-xxxxxxxx");
+                                }
+                                continue;
+                            }
                             if handle_slash_command(
                                 &input,
                                 &mut state,

@@ -13,6 +13,7 @@ pub enum ProgressEvent {
     ToolCallFinished { name: String, status: String, error: Option<String>, ts: i64 },
     StepFinished { iteration: u32, tool_count: usize },
     DiffAvailable { diff: String },
+    ContentWritten { path: String, content: String },
     Done { text_len: usize, tool_count: usize },
 }
 
@@ -227,12 +228,8 @@ impl Agent {
 
     pub async fn load_history(&self, messages: Vec<Message>) {
         let mut ctx = self.context.lock().await;
-        let session_id = self.session_id.lock().await.clone();
-        for msg in &messages {
-            ctx.history.push(msg.clone());
-            if let (Some(storage), Some(ref sid)) = (&self.storage, &session_id) {
-                let _ = storage.save_message(sid, msg);
-            }
+        for msg in messages {
+            ctx.history.push(msg);
         }
     }
 
@@ -500,6 +497,18 @@ impl Agent {
                                 error: None,
                                 ts: chrono::Utc::now().timestamp_millis(),
                             }).await;
+                            if call.name == "write" {
+                                if let (Some(path), Some(content)) = (
+                                    call.input.get("path").and_then(|v| v.as_str()),
+                                    call.input.get("content").and_then(|v| v.as_str()),
+                                ) {
+                                    self.emit(ProgressEvent::ContentWritten {
+                                        path: path.to_string(),
+                                        content: content.to_string(),
+                                    })
+                                    .await;
+                                }
+                            }
                             tool_call_results.push((
                                 call.id.clone(),
                                 call.name.clone(),
@@ -652,48 +661,23 @@ impl Agent {
 
         info!("Compaction produced summary of {} chars", summary.len());
 
-        // Create a child session with the summary
-        if let (Some(storage), Some(current_session_id)) =
-            (&self.storage, self.session_id.lock().await.as_ref())
-        {
-            let child_id = storage.create_child_session(
-                current_session_id,
-                "Compacted",
-                &self.config.system_prompt,
-                "deepseek-chat",
-            )?;
-            info!("Created child session {} for compacted context", child_id);
+        let summary_msg = Message::System {
+            id: uuid::Uuid::new_v4().to_string(),
+            content: format!(
+                "{}\n\n--- Conversation Summary ---\n{}",
+                self.config.system_prompt, summary
+            ),
+        };
 
-            let summary_msg = Message::System {
-                id: uuid::Uuid::new_v4().to_string(),
-                content: format!(
-                    "{}\n\n--- Conversation Summary ---\n{}",
-                    self.config.system_prompt, summary
-                ),
-            };
-            let _ = storage.save_message(&child_id, &summary_msg);
+        let mut ctx = self.context.lock().await;
+        ctx.history.messages.clear();
+        ctx.history.current_tokens = 0;
+        ctx.history.push(summary_msg.clone());
+        drop(ctx);
 
-            // Switch to child session
-            *self.session_id.lock().await = Some(child_id.clone());
-
-            // Update the context with the summary
-            let mut ctx = self.context.lock().await;
-            ctx.history.messages.clear();
-            ctx.history.current_tokens = 0;
-            ctx.history.push(summary_msg);
-        } else {
-            // Fallback: in-place replacement (no storage)
-            let mut ctx = self.context.lock().await;
-            ctx.history.messages.clear();
-            ctx.history.current_tokens = 0;
-            let system_msg = Message::System {
-                id: uuid::Uuid::new_v4().to_string(),
-                content: format!(
-                    "{}\n\n--- Conversation Summary ---\n{}",
-                    ctx.system_prompt, summary
-                ),
-            };
-            ctx.history.push(system_msg);
+        // Stay on the same session so TUI + SQLite history remain consistent.
+        if let (Some(storage), Some(sid)) = (&self.storage, self.session_id.lock().await.as_ref()) {
+            let _ = storage.save_message(sid, &summary_msg);
         }
 
         Ok(())

@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use crate::agent::{AgentOutput, ProgressEvent};
 use crate::markdown_render::render_markdown;
+use crate::types::{ContentPart, Message, ToolResultValue};
 
 // ── Turn timeline (OpenCode-style chronological blocks) ──
 
@@ -21,6 +22,7 @@ pub enum TurnItem {
     Step(u32),
     Tool(ToolLine),
     Diff { lines: Vec<String> },
+    WrittenFile { path: String, content: String },
     Reasoning(String),
     Text(String),
 }
@@ -108,6 +110,24 @@ impl ActiveTurn {
         } else {
             self.items.push(TurnItem::Reasoning(text.to_string()));
         }
+    }
+
+    fn push_written_file(&mut self, path: &str, content: &str) {
+        const MAX_LINES: usize = 100;
+        let lines: Vec<&str> = content.lines().collect();
+        let preview = if lines.len() > MAX_LINES {
+            format!(
+                "{}\n… ({} more lines)",
+                lines[..MAX_LINES].join("\n"),
+                lines.len() - MAX_LINES
+            )
+        } else {
+            content.to_string()
+        };
+        self.items.push(TurnItem::WrittenFile {
+            path: path.to_string(),
+            content: preview,
+        });
     }
 
     fn push_diff(&mut self, diff: &str) {
@@ -356,6 +376,9 @@ impl AppState {
             ProgressEvent::DiffAvailable { diff } => {
                 turn.push_diff(diff);
             }
+            ProgressEvent::ContentWritten { path, content } => {
+                turn.push_written_file(&path, &content);
+            }
             _ => {}
         }
     }
@@ -396,6 +419,110 @@ impl AppState {
     pub fn has_pending_permission(&self) -> bool {
         self.pending_permission.is_some()
     }
+}
+
+/// Rebuild TUI timeline from persisted session messages (user, tools, assistant text).
+pub fn hydrate_chat_messages(messages: &[Message]) -> Vec<ChatMessage> {
+    let mut out = Vec::new();
+    let mut current_turn: Option<Vec<TurnItem>> = None;
+
+    fn flush_turn(out: &mut Vec<ChatMessage>, current_turn: &mut Option<Vec<TurnItem>>) {
+        if let Some(items) = current_turn.take() {
+            if !items.is_empty() {
+                out.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    items,
+                    usage: None,
+                });
+            }
+        }
+    }
+
+    for msg in messages {
+        match msg {
+            Message::User { content, .. } => {
+                flush_turn(&mut out, &mut current_turn);
+                for part in content {
+                    if let ContentPart::Text { text } = part {
+                        out.push(ChatMessage {
+                            role: "user".to_string(),
+                            items: vec![TurnItem::Text(text.clone())],
+                            usage: None,
+                        });
+                    }
+                }
+            }
+            Message::Assistant { content, tool_calls, .. } => {
+                let turn = current_turn.get_or_insert_with(Vec::new);
+                for part in content {
+                    match part {
+                        ContentPart::Text { text } if !text.is_empty() => {
+                            turn.push(TurnItem::Text(text.clone()));
+                        }
+                        ContentPart::Reasoning { text } if !text.is_empty() => {
+                            turn.push(TurnItem::Reasoning(text.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+                for tc in tool_calls {
+                    turn.push(TurnItem::Tool(ToolLine {
+                        name: tc.name.clone(),
+                        target: extract_tool_target_from_value(&tc.name, &tc.input),
+                        status: ToolStatus::Running,
+                    }));
+                }
+            }
+            Message::Tool {
+                tool_name,
+                result,
+                ..
+            } => {
+                if let Some(ref mut turn) = current_turn {
+                    let err_msg = match result {
+                        ToolResultValue::Error { value } => Some(value.clone()),
+                        _ => None,
+                    };
+                    for item in turn.iter_mut().rev() {
+                        if let TurnItem::Tool(t) = item {
+                            if t.name == *tool_name && matches!(t.status, ToolStatus::Running) {
+                                t.status = if let Some(msg) = err_msg {
+                                    ToolStatus::Error { msg, ms: 0 }
+                                } else {
+                                    ToolStatus::Done { ms: 0 }
+                                };
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            Message::System { content, .. } if !content.is_empty() => {
+                flush_turn(&mut out, &mut current_turn);
+                out.push(ChatMessage {
+                    role: "system".to_string(),
+                    items: vec![TurnItem::Text(content.clone())],
+                    usage: None,
+                });
+            }
+            Message::System { .. } => {}
+        }
+    }
+    flush_turn(&mut out, &mut current_turn);
+    out
+}
+
+fn extract_tool_target_from_value(_name: &str, input: &serde_json::Value) -> String {
+    if let Some(cmd) = input.get("command").and_then(|c| c.as_str()) {
+        return truncate_chars(cmd, 50);
+    }
+    if let Some(path) = input.get("path").and_then(|p| p.as_str()) {
+        return truncate_chars(path, 50);
+    }
+    if let Some(pat) = input.get("pattern").and_then(|p| p.as_str()) {
+        return truncate_chars(pat, 50);
+    }
+    truncate_chars(&input.to_string(), 50)
 }
 
 fn extract_tool_target(name: &str, input: &str) -> String {
@@ -529,6 +656,9 @@ fn turn_items_to_text(items: &[TurnItem]) -> String {
                     out.push_str(l);
                     out.push('\n');
                 }
+            }
+            TurnItem::WrittenFile { path, content } => {
+                out.push_str(&format!("[file: {path}]\n{content}\n"));
             }
             _ => {}
         }
@@ -839,6 +969,23 @@ fn render_turn_items(items: &[TurnItem], lines: &mut Vec<Line>, width: u16, show
                     Style::default().fg(Color::DarkGray),
                 )));
             }
+            TurnItem::WrittenFile { path, content } => {
+                lines.push(Line::from(Span::styled(
+                    format!("  wrote {path}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                let lang = std::path::Path::new(path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(language_from_ext)
+                    .unwrap_or("");
+                let fence = if lang.is_empty() {
+                    format!("```\n{content}\n```")
+                } else {
+                    format!("```{lang}\n{content}\n```")
+                };
+                render_markdown(&fence, lines, width);
+            }
             TurnItem::Reasoning(r) if show_reasoning && !r.is_empty() => {
                 lines.push(Line::from(Span::styled(
                     "  ▸ thinking",
@@ -912,6 +1059,21 @@ fn format_duration(ms: i64) -> String {
 }
 
 const SPINNER: [char; 4] = ['◐', '◓', '◑', '◒'];
+
+fn language_from_ext(ext: &str) -> &str {
+    match ext {
+        "rs" => "rust",
+        "cpp" | "cc" | "cxx" | "h" | "hpp" => "cpp",
+        "py" => "python",
+        "js" | "ts" | "tsx" => "javascript",
+        "md" => "markdown",
+        "sh" | "bash" => "bash",
+        "json" => "json",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        _ => ext,
+    }
+}
 
 fn help_lines<'a>(agent_kind: &'a str, session_label: &'a str) -> Vec<Line<'a>> {
     let mode_line = format!("  mode: {agent_kind} · session: {session_label}");

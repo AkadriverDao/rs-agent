@@ -270,19 +270,50 @@ fn render_code_block(lang: &Option<String>, lines: &[String], out: &mut Vec<Line
     )));
     let w = max_width.saturating_sub(6) as usize;
     for line in lines {
-        out.push(Line::from(vec![
-            Span::styled("  │ ", Style::default().fg(Color::Yellow)),
-            Span::styled(
-                truncate_display(line, w),
-                Style::default().fg(Color::Gray),
-            ),
-        ]));
+        for chunk in wrap_line_chunks(line, w) {
+            out.push(Line::from(vec![
+                Span::styled("  │ ", Style::default().fg(Color::Yellow)),
+                Span::styled(chunk, Style::default().fg(Color::Gray)),
+            ]));
+        }
     }
     out.push(Line::from(Span::styled(
         "  └────────────────────────────────────",
         Style::default().fg(Color::Yellow),
     )));
     out.push(Line::from(""));
+}
+
+/// Soft-wrap a single line to display width without dropping characters.
+fn wrap_line_chunks(line: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![line.to_string()];
+    }
+    if display_width(line) <= width {
+        return vec![line.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < line.len() {
+        let mut end = start;
+        let mut w = 0usize;
+        while end < line.len() {
+            let ch = line[end..].chars().next().unwrap();
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if w + cw > width {
+                break;
+            }
+            end += ch.len_utf8();
+            w += cw;
+        }
+        if end == start {
+            let ch = line[start..].chars().next().unwrap();
+            end = start + ch.len_utf8();
+        }
+        chunks.push(line[start..end].to_string());
+        start = end;
+    }
+    chunks
 }
 
 fn render_table(rows: &[Vec<String>], out: &mut Vec<Line>, width: usize) {

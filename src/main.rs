@@ -175,36 +175,9 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut state = AppState::new(def.name, &session_id);
     let mut current_kind = agent_kind;
 
-    for msg in &prior_messages {
-        match msg {
-            Message::User { content, .. } => {
-                for part in content {
-                    if let ContentPart::Text { text } = part {
-                        state.add_user_message(text);
-                    }
-                }
-            }
-            Message::Assistant { content, .. } => {
-                let text: String = content
-                    .iter()
-                    .filter_map(|p| {
-                        if let ContentPart::Text { text } = p {
-                            Some(text.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if !text.is_empty() {
-                    state.messages.push(tui::ChatMessage {
-                        role: "assistant".to_string(),
-                        items: vec![tui::TurnItem::Text(text)],
-                        usage: None,
-                    });
-                }
-            }
-            _ => {}
-        }
+    if !prior_messages.is_empty() {
+        state.messages = tui::hydrate_chat_messages(&prior_messages);
+        state.scroll = usize::MAX;
     }
 
     'tui: loop {

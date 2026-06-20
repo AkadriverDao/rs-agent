@@ -8,6 +8,7 @@ use tracing::{debug, error, info, warn};
 pub enum ProgressEvent {
     LlmCall { iteration: u32 },
     Token { text: String },
+    ReasoningToken { text: String },
     ToolCallStarted { name: String, input: String, ts: i64 },
     ToolCallFinished { name: String, status: String, error: Option<String>, ts: i64 },
     StepFinished { iteration: u32, tool_count: usize },
@@ -65,6 +66,12 @@ RULES:
 3. To see code for reference → use `read`
 4. Each `edit` call is one SEARCH/REPLACE block, showing only the changed portion.
 
+PROJECT ANALYSIS:
+- Start with `glob` (e.g. "src/**/*.rs", "Cargo.toml") — do NOT run `find .` over the whole tree
+- Read key files: Cargo.toml, README.md, src/lib.rs or src/main.rs — not every file
+- After gathering enough context, STOP calling tools and write a complete summary for the user
+- Never read the same file twice unless it changed
+
 Available: read, write, edit, glob, grep, bash, webfetch, websearch, git_commit, git_status, git_diff, undo.
 "#
             .to_string(),
@@ -92,6 +99,9 @@ If file modifications are needed, describe the changes and ask the user to appro
             system_prompt: r#"You are a general-purpose assistant running on macOS.
 You have access to tools for reading, writing, searching, and executing commands.
 Use the appropriate tool to help the user with their request.
+
+When analyzing a project: use `glob` and read key files (Cargo.toml, README, entry points).
+Avoid scanning the entire directory tree with bash find. After enough exploration, give a complete written answer — do not keep calling tools indefinitely.
 "#
             .to_string(),
         },
@@ -242,8 +252,17 @@ impl Agent {
 
         loop {
             if iteration >= self.config.max_iterations {
-                info!("Agent reached max iterations ({})", self.config.max_iterations);
-                break;
+                info!(
+                    "Agent reached max iterations ({}), forcing final summary",
+                    self.config.max_iterations
+                );
+                {
+                    let mut total = self.total_usage.lock().await;
+                    total.merge(&accumulated_usage);
+                }
+                return self
+                    .force_final_response(tool_call_results, accumulated_usage)
+                    .await;
             }
             iteration += 1;
 
@@ -289,6 +308,7 @@ impl Agent {
                     }
                     LlmEvent::ReasoningDelta { text, .. } => {
                         collected_reasoning.push_str(&text);
+                        self.emit(ProgressEvent::ReasoningToken { text }).await;
                     }
                     LlmEvent::ToolCallReceived { id, name, input } => {
                         pending_tool_calls.push(ToolCall { id, name, input });
@@ -588,25 +608,6 @@ impl Agent {
                 });
             }
         }
-
-        let ctx = self.context.lock().await;
-        let (_system, _messages, _) = ctx.build_request();
-        drop(ctx);
-
-        {
-            let mut total = self.total_usage.lock().await;
-            total.merge(&accumulated_usage);
-        }
-        let total_usage = Some(self.total_usage.lock().await.clone());
-
-        Ok(AgentOutput {
-            text: String::new(),
-            reasoning: None,
-            tool_calls: Vec::new(),
-            tool_results: Vec::new(),
-            finish_reason: FinishReason::Stop,
-            usage: total_usage,
-        })
     }
 
     async fn compact(&self) -> Result<(), anyhow::Error> {
@@ -697,22 +698,111 @@ impl Agent {
 
         Ok(())
     }
+
+    /// One final LLM call without tools when the iteration budget is exhausted.
+    async fn force_final_response(
+        &self,
+        tool_call_results: Vec<(String, String, ToolResultValue)>,
+        accumulated_usage: Usage,
+    ) -> Result<AgentOutput, anyhow::Error> {
+        let ctx = self.context.lock().await;
+        let (system, messages, _) = ctx.build_request();
+        drop(ctx);
+
+        let finalize_system = format!(
+            "{}\n\n## IMPORTANT\n\
+             You have reached the tool-call step limit ({} steps). \
+             You MUST now write a complete final answer for the user based on all information gathered. \
+             Do NOT call any tools. Provide a clear summary, analysis, or conclusion.",
+            system,
+            self.config.max_iterations
+        );
+
+        let mut stream = self
+            .llm
+            .stream_chat(messages, Vec::new(), &finalize_system)
+            .await?;
+
+        let mut text = String::new();
+        let mut reasoning = String::new();
+
+        while let Some(event) = stream.next().await {
+            match event {
+                LlmEvent::TextDelta { text: t, .. } => {
+                    text.push_str(&t);
+                    self.emit(ProgressEvent::Token { text: t }).await;
+                }
+                LlmEvent::ReasoningDelta { text: t, .. } => {
+                    reasoning.push_str(&t);
+                    self.emit(ProgressEvent::ReasoningToken { text: t }).await;
+                }
+                _ => {}
+            }
+        }
+
+        let fallback = format!(
+            "Reached the {}-step tool limit before finishing. \
+             I gathered tool results but could not produce a summary. \
+             Try asking a more specific question, or say \"continue\" to keep going.",
+            self.config.max_iterations
+        );
+
+        {
+            let mut total = self.total_usage.lock().await;
+            total.merge(&accumulated_usage);
+        }
+
+        Ok(AgentOutput {
+            text: if text.trim().is_empty() {
+                fallback
+            } else {
+                text
+            },
+            reasoning: if reasoning.is_empty() {
+                None
+            } else {
+                Some(reasoning)
+            },
+            tool_calls: Vec::new(),
+            tool_results: tool_call_results,
+            finish_reason: FinishReason::Length,
+            usage: Some(self.total_usage.lock().await.clone()),
+        })
+    }
 }
 
 fn summarize_value(v: &serde_json::Value, max: usize) -> String {
+    if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+        return truncate_str(cmd, max);
+    }
+    if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
+        return truncate_str(path, max);
+    }
+    if let Some(expr) = v.get("expression").and_then(|e| e.as_str()) {
+        return truncate_str(expr, max);
+    }
+    if let Some(query) = v.get("query").and_then(|q| q.as_str()) {
+        return truncate_str(query, max);
+    }
+    if let Some(url) = v.get("url").and_then(|u| u.as_str()) {
+        return truncate_str(url, max);
+    }
     let s = match v {
         serde_json::Value::String(s) => s.clone(),
         _ => v.to_string(),
     };
-    if s.len() > max {
-        let mut end = max;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &s[..end])
-    } else {
-        s
+    truncate_str(&s, max)
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
     }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
 }
 
 fn extract_tool_result_value(output: &crate::types::ToolOutput) -> ToolResultValue {

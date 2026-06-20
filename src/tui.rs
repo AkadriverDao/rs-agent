@@ -1,74 +1,311 @@
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame, Terminal,
 };
 use std::io;
+use std::sync::mpsc;
+use std::time::Duration;
 
-use crate::agent::AgentOutput;
+use crate::agent::{AgentOutput, ProgressEvent};
+use crate::markdown_render::render_markdown;
+
+// ── Turn timeline (OpenCode-style chronological blocks) ──
+
+#[derive(Debug, Clone)]
+pub enum TurnItem {
+    Step(u32),
+    Tool(ToolLine),
+    Diff { lines: Vec<String> },
+    Reasoning(String),
+    Text(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolLine {
+    pub name: String,
+    pub target: String,
+    pub status: ToolStatus,
+}
+
+#[derive(Debug, Clone)]
+pub enum ToolStatus {
+    Running,
+    Done { ms: i64 },
+    Error { msg: String, ms: i64 },
+}
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
-    pub reasoning: Option<String>,
-    pub tool_calls: Vec<String>,
+    pub items: Vec<TurnItem>,
     pub usage: Option<String>,
 }
+
+struct ActiveTurn {
+    items: Vec<TurnItem>,
+}
+
+impl ActiveTurn {
+    fn new() -> Self {
+        Self { items: Vec::new() }
+    }
+
+    fn push_step(&mut self, iteration: u32) {
+        if iteration > 1 {
+            self.items.push(TurnItem::Step(iteration));
+        }
+    }
+
+    fn push_tool_start(&mut self, name: &str, target: &str) {
+        self.items.push(TurnItem::Tool(ToolLine {
+            name: name.to_string(),
+            target: target.to_string(),
+            status: ToolStatus::Running,
+        }));
+    }
+
+    fn finish_tool(&mut self, name: &str, status: &str, error: &Option<String>, ms: Option<i64>) {
+        let ms = ms.unwrap_or(0);
+        for item in self.items.iter_mut().rev() {
+            if let TurnItem::Tool(t) = item {
+                if t.name == name && matches!(t.status, ToolStatus::Running) {
+                    t.status = if status == "error" {
+                        ToolStatus::Error {
+                            msg: error.clone().unwrap_or_else(|| "failed".into()),
+                            ms,
+                        }
+                    } else {
+                        ToolStatus::Done { ms }
+                    };
+                    return;
+                }
+            }
+        }
+    }
+
+    fn append_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(TurnItem::Text(buf)) = self.items.last_mut() {
+            buf.push_str(text);
+        } else {
+            self.items.push(TurnItem::Text(text.to_string()));
+        }
+    }
+
+    fn append_reasoning(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(TurnItem::Reasoning(buf)) = self.items.last_mut() {
+            buf.push_str(text);
+        } else {
+            self.items.push(TurnItem::Reasoning(text.to_string()));
+        }
+    }
+
+    fn push_diff(&mut self, diff: &str) {
+        let mut lines = Vec::new();
+        for line in diff.lines().take(40) {
+            if line.starts_with("+++") || line.starts_with("---") {
+                continue;
+            }
+            if line.starts_with('+') {
+                lines.push(format!("+{}", &line[1..]));
+            } else if line.starts_with('-') {
+                lines.push(format!("-{}", &line[1..]));
+            } else if line.starts_with("@@") {
+                lines.push(format!("~{}", line));
+            }
+        }
+        if diff.lines().count() > 40 {
+            lines.push("…".into());
+        }
+        if !lines.is_empty() {
+            self.items.push(TurnItem::Diff { lines });
+        }
+    }
+}
+
+// ── Permission bridge ──
+
+pub struct PendingPermission {
+    pub tool_name: String,
+    pub input_summary: String,
+    response_tx: mpsc::Sender<bool>,
+}
+
+impl PendingPermission {
+    pub fn respond(self, allowed: bool) {
+        let _ = self.response_tx.send(allowed);
+    }
+}
+
+pub struct PermissionRequest {
+    pub tool_name: String,
+    pub input_summary: String,
+    response_tx: mpsc::Sender<bool>,
+}
+
+pub struct PermissionBridge {
+    request_tx: mpsc::Sender<PermissionRequest>,
+}
+
+impl PermissionBridge {
+    pub fn pair() -> (Self, mpsc::Receiver<PermissionRequest>) {
+        let (tx, rx) = mpsc::channel();
+        (Self { request_tx: tx }, rx)
+    }
+
+    pub fn make_approver(
+        self: std::sync::Arc<Self>,
+        storage: std::sync::Arc<crate::storage::Storage>,
+        session_id: String,
+    ) -> crate::permission::Approver {
+        std::sync::Arc::new(move |tool_name, input| {
+            let summary = summarize_tool_input(input);
+            let (resp_tx, resp_rx) = mpsc::channel();
+            let _ = self.request_tx.send(PermissionRequest {
+                tool_name: tool_name.to_string(),
+                input_summary: summary,
+                response_tx: resp_tx,
+            });
+            let allowed = resp_rx.recv().unwrap_or(false);
+            if allowed {
+                let _ = storage.save_permission_rule(&session_id, tool_name, "allow");
+            }
+            allowed
+        })
+    }
+}
+
+fn summarize_tool_input(input: &serde_json::Value) -> String {
+    if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+        return path.to_string();
+    }
+    if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+        return truncate_chars(cmd, 80);
+    }
+    truncate_chars(&input.to_string(), 80)
+}
+
+// ── App state ──
 
 pub struct AppState {
     pub messages: Vec<ChatMessage>,
     pub agent_kind: String,
+    pub model: String,
+    pub session_label: String,
     pub input: String,
     pub scroll: usize,
+    /// Updated each frame; used for stable scroll up/down from the bottom.
+    pub max_scroll: usize,
     pub thinking: bool,
     pub spinner: u64,
-    pub live_events: Vec<String>,
-    pub streaming_text: String,
+    active_turn: Option<ActiveTurn>,
     pub tool_starts: std::collections::HashMap<String, i64>,
+    pub pending_permission: Option<PendingPermission>,
+    pub usage_in: u64,
+    pub usage_out: u64,
+    pub usage_cache: u64,
+    pub show_reasoning: bool,
 }
 
 impl AppState {
-    pub fn new(agent_kind: &str) -> Self {
+    pub fn new(agent_kind: &str, session_id: &str) -> Self {
+        let short = if session_id.len() > 8 {
+            &session_id[..8]
+        } else {
+            session_id
+        };
         Self {
             messages: Vec::new(),
             agent_kind: agent_kind.to_string(),
+            model: "deepseek-chat".to_string(),
+            session_label: short.to_string(),
             input: String::new(),
             scroll: usize::MAX,
+            max_scroll: 0,
             thinking: false,
             spinner: 0,
-            live_events: Vec::new(),
-            streaming_text: String::new(),
+            active_turn: None,
             tool_starts: std::collections::HashMap::new(),
+            pending_permission: None,
+            usage_in: 0,
+            usage_out: 0,
+            usage_cache: 0,
+            show_reasoning: true,
         }
+    }
+
+    pub fn begin_turn(&mut self) {
+        self.thinking = true;
+        self.active_turn = Some(ActiveTurn::new());
+        self.tool_starts.clear();
     }
 
     pub fn add_user_message(&mut self, text: &str) {
         self.messages.push(ChatMessage {
             role: "user".to_string(),
-            content: text.to_string(),
-            reasoning: None,
-            tool_calls: Vec::new(),
+            items: vec![TurnItem::Text(text.to_string())],
+            usage: None,
+        });
+        self.scroll = usize::MAX;
+    }
+
+    pub fn add_system_message(&mut self, text: &str) {
+        self.messages.push(ChatMessage {
+            role: "system".to_string(),
+            items: vec![TurnItem::Text(text.to_string())],
             usage: None,
         });
         self.scroll = usize::MAX;
     }
 
     pub fn add_agent_message(&mut self, output: &AgentOutput) {
-        let tools: Vec<String> = output
-            .tool_results
-            .iter()
-            .map(|(_, name, result)| {
-                let icon = match result {
-                    crate::types::ToolResultValue::Error { .. } => "✘",
-                    _ => "✔",
-                };
-                format!("{} {}", icon, name)
-            })
-            .collect();
+        let follow_bottom = self.scroll == usize::MAX;
+        let mut items = self
+            .active_turn
+            .take()
+            .map(|t| t.items)
+            .unwrap_or_default();
+
+        if let Some(ref r) = output.reasoning {
+            if !r.is_empty() && !items.iter().any(|i| matches!(i, TurnItem::Reasoning(_))) {
+                items.insert(0, TurnItem::Reasoning(r.clone()));
+            }
+        }
+
+        let has_text = items.iter().any(|i| matches!(i, TurnItem::Text(t) if !t.is_empty()));
+        if !output.text.is_empty() {
+            let final_text = output.text.trim();
+            // Append final answer after tool blocks (OpenCode order: tools → conclusion)
+            let already_shown = items.iter().any(|i| {
+                matches!(i, TurnItem::Text(t) if t.trim() == final_text || t.ends_with(final_text))
+            });
+            if !already_shown {
+                items.push(TurnItem::Text(output.text.clone()));
+            } else if !has_text {
+                items.push(TurnItem::Text(output.text.clone()));
+            }
+        }
+
+        if items.is_empty() && output.text.is_empty() {
+            items.push(TurnItem::Text("(no response)".into()));
+        }
+
+        if let Some(ref u) = output.usage {
+            self.usage_in = u.input_tokens;
+            self.usage_out = u.output_tokens;
+            self.usage_cache = u.cache_read_input_tokens.unwrap_or(0);
+        }
+
         let usage = output.usage.as_ref().map(|u| {
             format!(
                 "{}↑ {}↓{}",
@@ -80,26 +317,129 @@ impl AppState {
                     .unwrap_or_default()
             )
         });
+
         self.messages.push(ChatMessage {
             role: "assistant".to_string(),
-            content: output.text.clone(),
-            reasoning: output.reasoning.clone(),
-            tool_calls: tools,
+            items,
             usage,
         });
-        self.scroll = usize::MAX;
+        if follow_bottom {
+            self.scroll = usize::MAX;
+        }
         self.thinking = false;
-        self.streaming_text.clear();
+    }
+
+    pub fn apply_progress(&mut self, ev: &ProgressEvent) {
+        let turn = self
+            .active_turn
+            .get_or_insert_with(ActiveTurn::new);
+
+        match ev {
+            ProgressEvent::LlmCall { iteration } => {
+                turn.push_step(*iteration);
+            }
+            ProgressEvent::Token { text } => {
+                turn.append_text(text);
+            }
+            ProgressEvent::ReasoningToken { text } => {
+                turn.append_reasoning(text);
+            }
+            ProgressEvent::ToolCallStarted { name, input, ts } => {
+                self.tool_starts.insert(name.clone(), *ts);
+                let target = extract_tool_target(name, input);
+                turn.push_tool_start(name, &target);
+            }
+            ProgressEvent::ToolCallFinished { name, status, error, ts } => {
+                let ms = self.tool_starts.remove(name).map(|s| *ts - s);
+                turn.finish_tool(name, status, error, ms);
+            }
+            ProgressEvent::DiffAvailable { diff } => {
+                turn.push_diff(diff);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn take_permission_request(&mut self, req: PermissionRequest) {
+        self.pending_permission = Some(PendingPermission {
+            tool_name: req.tool_name,
+            input_summary: req.input_summary,
+            response_tx: req.response_tx,
+        });
+    }
+
+    pub fn respond_permission(&mut self, allowed: bool) {
+        if let Some(p) = self.pending_permission.take() {
+            p.respond(allowed);
+        }
+    }
+
+    pub fn push_turn_error(&mut self, message: &str) {
+        let follow_bottom = self.scroll == usize::MAX;
+        let items = if let Some(mut turn) = self.active_turn.take() {
+            turn.items.push(TurnItem::Text(format!("✘ {}", message)));
+            turn.items
+        } else {
+            vec![TurnItem::Text(format!("✘ {}", message))]
+        };
+        self.messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            items,
+            usage: None,
+        });
+        if follow_bottom {
+            self.scroll = usize::MAX;
+        }
+        self.thinking = false;
+    }
+
+    pub fn has_pending_permission(&self) -> bool {
+        self.pending_permission.is_some()
     }
 }
+
+fn extract_tool_target(name: &str, input: &str) -> String {
+    // Try parsing as JSON first (progress events send serialized tool input)
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(input) {
+        if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+            return truncate_chars(cmd, 50);
+        }
+        if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
+            return truncate_chars(path, 50);
+        }
+        if let Some(pat) = v.get("pattern").and_then(|p| p.as_str()) {
+            return truncate_chars(pat, 50);
+        }
+    }
+    if name == "bash" || name == "git status" {
+        return truncate_chars(input.trim().trim_matches('"'), 50);
+    }
+    if let Some(path) = input.split("\"path\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+    {
+        return path.to_string();
+    }
+    if let Some(cmd) = input.split("\"command\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+    {
+        return truncate_chars(cmd, 50);
+    }
+    truncate_chars(input.trim().trim_matches('"'), 50)
+}
+
+// ── Terminal setup ──
 
 pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
+    // Do not capture mouse — allows terminal native select + Cmd+C copy.
     crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    Terminal::new(backend)
+    Terminal::new(CrosstermBackend::new(stdout))
 }
+
+pub type AppTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 pub fn restore_terminal() -> io::Result<()> {
     crossterm::terminal::disable_raw_mode()?;
@@ -107,265 +447,626 @@ pub fn restore_terminal() -> io::Result<()> {
     Ok(())
 }
 
-pub fn draw(frame: &mut Frame, state: &AppState) {
+pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut child = Command::new("pbcopy")
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("pbcopy: {e}"))?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "pbcopy stdin".to_string())?
+            .write_all(text.as_bytes())
+            .map_err(|e| format!("pbcopy write: {e}"))?;
+        child.wait().map_err(|e| format!("pbcopy wait: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if Command::new("wl-copy")
+            .stdin(Stdio::piped())
+            .spawn()
+            .ok()
+            .and_then(|mut child| {
+                child.stdin.as_mut()?.write_all(text.as_bytes()).ok()?;
+                child.wait().ok()?;
+                Some(())
+            })
+            .is_some()
+        {
+            return Ok(());
+        }
+        let mut child = Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("xclip: {e}"))?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "xclip stdin".to_string())?
+            .write_all(text.as_bytes())
+            .map_err(|e| format!("xclip write: {e}"))?;
+        child.wait().map_err(|e| format!("xclip wait: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = text;
+        return Err("clipboard unsupported on this OS".into());
+    }
+}
+
+fn turn_items_to_text(items: &[TurnItem]) -> String {
+    let mut out = String::new();
+    for item in items {
+        match item {
+            TurnItem::Text(t) if !t.is_empty() => {
+                out.push_str(t);
+                if !t.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            TurnItem::Tool(t) => {
+                out.push_str(&format!("  {} {}\n", t.name, t.target));
+            }
+            TurnItem::Step(n) => out.push_str(&format!("  step {n}\n")),
+            TurnItem::Reasoning(r) if !r.is_empty() => {
+                out.push_str("[thinking]\n");
+                out.push_str(r);
+                out.push('\n');
+            }
+            TurnItem::Diff { lines } => {
+                out.push_str("[changes]\n");
+                for l in lines {
+                    out.push_str(l);
+                    out.push('\n');
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+impl AppState {
+    pub fn export_conversation(&self) -> String {
+        let mut out = String::new();
+        for msg in &self.messages {
+            match msg.role.as_str() {
+                "user" => {
+                    for item in &msg.items {
+                        if let TurnItem::Text(t) = item {
+                            out.push_str("> ");
+                            out.push_str(t);
+                            out.push('\n');
+                        }
+                    }
+                }
+                "assistant" => {
+                    out.push_str(&turn_items_to_text(&msg.items));
+                    if let Some(u) = &msg.usage {
+                        out.push_str(&format!("── {u} ──\n"));
+                    }
+                }
+                "system" => {
+                    for item in &msg.items {
+                        if let TurnItem::Text(t) = item {
+                            out.push_str(&format!("[{t}]\n"));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            out.push('\n');
+        }
+        if self.thinking {
+            if let Some(turn) = &self.active_turn {
+                out.push_str(&turn_items_to_text(&turn.items));
+            }
+        }
+        out
+    }
+
+    pub fn export_last_assistant(&self) -> Option<String> {
+        if self.thinking {
+            if let Some(turn) = &self.active_turn {
+                if !turn.items.is_empty() {
+                    return Some(turn_items_to_text(&turn.items));
+                }
+            }
+        }
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .map(|m| {
+                let mut s = turn_items_to_text(&m.items);
+                if let Some(u) = &m.usage {
+                    s.push_str(&format!("── {u} ──\n"));
+                }
+                s
+            })
+    }
+
+    pub fn copy_last_assistant(&self) -> Result<usize, String> {
+        let text = self
+            .export_last_assistant()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "nothing to copy".to_string())?;
+        let len = text.len();
+        copy_to_clipboard(&text)?;
+        Ok(len)
+    }
+
+    pub fn copy_conversation(&self) -> Result<usize, String> {
+        let text = self.export_conversation();
+        if text.trim().is_empty() {
+            return Err("nothing to copy".into());
+        }
+        let len = text.len();
+        copy_to_clipboard(&text)?;
+        Ok(len)
+    }
+}
+
+fn resolve_scroll(scroll: usize, max_scroll: usize) -> usize {
+    if scroll == usize::MAX {
+        max_scroll
+    } else {
+        scroll.min(max_scroll)
+    }
+}
+
+pub fn scroll_up(state: &mut AppState, amount: usize) {
+    let current = resolve_scroll(state.scroll, state.max_scroll);
+    state.scroll = current.saturating_sub(amount);
+}
+
+pub fn scroll_down(state: &mut AppState, amount: usize) {
+    let current = resolve_scroll(state.scroll, state.max_scroll);
+    if current + amount >= state.max_scroll {
+        state.scroll = usize::MAX;
+    } else {
+        state.scroll = current + amount;
+    }
+}
+
+pub fn scroll_to_bottom(state: &mut AppState) {
+    state.scroll = usize::MAX;
+}
+
+pub fn handle_scroll_key(state: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
+    match code {
+        KeyCode::Up => scroll_up(state, 1),
+        KeyCode::Down => scroll_down(state, 1),
+        KeyCode::PageUp => scroll_up(state, 10),
+        KeyCode::PageDown => scroll_down(state, 10),
+        KeyCode::Home => state.scroll = 0,
+        KeyCode::End => state.scroll = usize::MAX,
+        KeyCode::Char('l') | KeyCode::Char('L')
+            if modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            state.scroll = usize::MAX;
+        }
+        _ => {}
+    }
+}
+
+pub fn try_copy_key(state: &mut AppState, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    if code == KeyCode::Char('y') && modifiers.contains(KeyModifiers::CONTROL) {
+        match state.copy_last_assistant() {
+            Ok(n) => state.add_system_message(&format!("Copied last reply ({n} bytes).")),
+            Err(e) => state.add_system_message(&format!("Copy failed: {e}")),
+        }
+        return true;
+    }
+    false
+}
+
+/// Poll scroll keys without blocking (safe during agent runs).
+pub fn poll_scroll_input(state: &mut AppState) {
+    while event::poll(Duration::from_millis(0)).unwrap_or(false) {
+        if let Ok(Event::Key(key)) = event::read() {
+            if key.kind == KeyEventKind::Press
+                && !try_copy_key(state, key.code, key.modifiers)
+            {
+                handle_scroll_key(state, key.code, key.modifiers);
+            }
+        }
+    }
+}
+
+// ── Draw ──
+
+pub fn draw(frame: &mut Frame, state: &mut AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
+            Constraint::Length(5),
             Constraint::Length(1),
         ])
         .split(frame.area());
 
     draw_messages(frame, chunks[0], state);
     draw_input(frame, chunks[1], state);
-    draw_progress(frame, chunks[2], state);
-    draw_status(frame, chunks[3], state);
+    draw_status(frame, chunks[2], state);
+
+    if state.pending_permission.is_some() {
+        draw_permission_modal(frame, state);
+    }
 }
 
-fn draw_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
+fn draw_messages(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    let lines = build_message_lines(
+        &state.messages,
+        state.thinking,
+        state.active_turn.as_ref(),
+        state.spinner,
+        state.show_reasoning,
+        area.width,
+        if state.messages.is_empty() && !state.thinking {
+            Some((&state.agent_kind, &state.session_label))
+        } else {
+            None
+        },
+    );
+    let max_scroll = lines.len().saturating_sub(area.height.max(1) as usize);
+    state.max_scroll = max_scroll;
+
+    // Keep a fixed offset valid when the buffer grows (e.g. streaming).
+    if state.scroll != usize::MAX && state.scroll > max_scroll {
+        state.scroll = max_scroll;
+    }
+
+    let scroll = resolve_scroll(state.scroll, max_scroll);
+
+    // Lines are pre-wrapped to terminal width; do not wrap again or scroll offsets drift.
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).scroll((scroll as u16, 0)),
+        area,
+    );
+}
+
+fn build_message_lines<'a>(
+    messages: &'a [ChatMessage],
+    thinking: bool,
+    active_turn: Option<&'a ActiveTurn>,
+    spinner: u64,
+    show_reasoning: bool,
+    width: u16,
+    help: Option<(&'a str, &'a str)>,
+) -> Vec<Line<'a>> {
     let mut lines: Vec<Line> = Vec::new();
 
-    for msg in &state.messages {
-        match msg.role.as_str() {
-            "user" => {
-                let width = area.width.saturating_sub(6).max(10) as usize;
+    for msg in messages {
+        render_message(msg, &mut lines, width, show_reasoning);
+    }
+
+    if thinking {
+        if let Some(turn) = active_turn {
+            if turn.items.is_empty() {
+                let sp = SPINNER[(spinner as usize) % 4];
                 lines.push(Line::from(Span::styled(
-                    format!("> {}", truncate(&msg.content, width)),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    format!("{} working…", sp),
+                    Style::default().fg(Color::Cyan),
                 )));
-                lines.push(Line::from(""));
+            } else {
+                render_turn_items(&turn.items, &mut lines, width, show_reasoning);
             }
-            "assistant" => {
-                // Reasoning box
-                if let Some(ref reasoning) = msg.reasoning {
-                    if !reasoning.is_empty() {
+        }
+    }
+
+    if messages.is_empty() && !thinking {
+        if let Some((agent_kind, session_label)) = help {
+            lines.extend(help_lines(agent_kind, session_label));
+        }
+    }
+
+    lines
+}
+
+fn render_message(msg: &ChatMessage, lines: &mut Vec<Line>, width: u16, show_reasoning: bool) {
+    match msg.role.as_str() {
+        "user" => {
+            for item in &msg.items {
+                if let TurnItem::Text(text) = item {
+                    for line in text.lines() {
                         lines.push(Line::from(Span::styled(
-                            "┌ reasoning ───────────────────────┐",
-                            Style::default().fg(Color::DarkGray),
+                            format!("> {}", truncate_chars(line, width.saturating_sub(4) as usize)),
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                         )));
-                        for line in textwrap::fill(reasoning, 56).lines() {
-                            lines.push(Line::from(Span::styled(
-                                format!("│ {}", line),
-                                Style::default().fg(Color::DarkGray),
-                            )));
-                        }
-                        lines.push(Line::from(Span::styled(
-                            "└──────────────────────────────────┘",
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                        lines.push(Line::from(""));
                     }
                 }
-
-                // Response text
-                format_response(&msg.content, &mut lines, area.width);
-
-                // Tool calls (after message is done)
-                for tc in &msg.tool_calls {
+            }
+            lines.push(Line::from(""));
+        }
+        "assistant" => {
+            render_turn_items(&msg.items, lines, width, show_reasoning);
+            if let Some(ref usage) = msg.usage {
+                lines.push(Line::from(Span::styled(
+                    format!("  ── {} ──", usage),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            lines.push(Line::from(""));
+        }
+        "system" => {
+            for item in &msg.items {
+                if let TurnItem::Text(t) = item {
                     lines.push(Line::from(Span::styled(
-                        format!("  {}", tc),
-                        Style::default().fg(Color::Cyan),
+                        format!("  ◇ {}", t),
+                        Style::default().fg(Color::Yellow),
                     )));
                 }
+            }
+            lines.push(Line::from(""));
+        }
+        _ => {}
+    }
+}
 
-                if let Some(ref usage) = msg.usage {
+fn render_turn_items(items: &[TurnItem], lines: &mut Vec<Line>, width: u16, show_reasoning: bool) {
+    for item in items {
+        match item {
+            TurnItem::Step(n) => {
+                lines.push(Line::from(Span::styled(
+                    format!("  ── step {} ──", n),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            TurnItem::Tool(t) => {
+                lines.push(render_tool_line(t));
+            }
+            TurnItem::Diff { lines: diff_lines } => {
+                lines.push(Line::from(Span::styled(
+                    "  ┌ changes ─────────────────────────",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for dl in diff_lines {
+                    lines.push(styled_diff_line(dl));
+                }
+                lines.push(Line::from(Span::styled(
+                    "  └──────────────────────────────────",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            TurnItem::Reasoning(r) if show_reasoning && !r.is_empty() => {
+                lines.push(Line::from(Span::styled(
+                    "  ▸ thinking",
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                )));
+                for line in textwrap::fill(r, 58).lines() {
                     lines.push(Line::from(Span::styled(
-                        format!("  {}", usage),
+                        format!("    {}", line),
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
                 lines.push(Line::from(""));
             }
-            _ => {}
-        }
-    }
-
-    // Show streaming response text while generating (no truncation)
-    if state.thinking && !state.streaming_text.is_empty() {
-        for line in state.streaming_text.lines() {
-            if line.starts_with("```") {
-                lines.push(Line::from(Span::styled(
-                    line,
-                    Style::default().fg(Color::Yellow),
-                )));
-            } else {
-                lines.push(Line::from(Span::raw(line.to_string())));
+            TurnItem::Reasoning(_) => {}
+            TurnItem::Text(text) if !text.is_empty() => {
+                render_markdown(text, lines, width);
             }
-        }
-        lines.push(Line::from(""));
-    }
-
-    // Execution flow — shown during and after execution
-    if !state.live_events.is_empty() || state.thinking {
-        if state.live_events.is_empty() && state.thinking {
-            let spinner = ['◐', '◓', '◑', '◒'][(state.spinner as usize) % 4];
-            lines.push(Line::from(Span::styled(
-                format!("{} generating...", spinner),
-                Style::default().fg(Color::Cyan),
-            )));
-        }
-        for ev in &state.live_events {
-            let (color, modifier) = if ev.starts_with('+') {
-                (Color::Green, Modifier::empty())
-            } else if ev.starts_with('-') {
-                (Color::Red, Modifier::empty())
-            } else if ev.starts_with('~') {
-                (Color::Yellow, Modifier::empty())
-            } else if ev.starts_with("→") || ev.starts_with("←") || ev.starts_with("$") {
-                (Color::Cyan, Modifier::BOLD)
-            } else if ev.starts_with("✗") || ev.starts_with("✘") {
-                (Color::Red, Modifier::BOLD)
-            } else if ev.starts_with("✔") {
-                (Color::Green, Modifier::BOLD)
-            } else {
-                (Color::DarkGray, Modifier::empty())
-            };
-            lines.push(Line::from(Span::styled(
-                ev,
-                Style::default().fg(color).add_modifier(modifier),
-            )));
+            TurnItem::Text(_) => {}
         }
     }
-
-    // Help screen when no messages
-    if state.messages.is_empty() && !state.thinking {
-        let help = vec![
-            Line::from(Span::styled(
-                "  agent-engine",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                format!("  mode: {}", state.agent_kind),
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Type a message below and press Enter to start.",
-                Style::default().fg(Color::White),
-            )),
-            Line::from(Span::styled(
-                "  Esc to quit, ↑↓ to scroll.",
-                Style::default().fg(Color::White),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Commands:",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "    /quit  -  exit",
-                Style::default().fg(Color::White),
-            )),
-        ];
-        let height = area.height as usize;
-        let top_pad = height.saturating_sub(help.len() + 4) / 2;
-        for _ in 0..top_pad {
-            lines.push(Line::from(""));
-        }
-        lines.extend(help);
-    }
-
-    // Scroll
-    let max_scroll = lines.len().saturating_sub(area.height.max(1) as usize);
-    let scroll = if state.scroll == usize::MAX {
-        max_scroll
-    } else {
-        state.scroll.min(max_scroll)
-    };
-
-    let messages = Paragraph::new(Text::from(lines))
-        .scroll((scroll as u16, 0))
-        .wrap(Wrap { trim: false });
-
-    frame.render_widget(messages, area);
 }
 
-fn format_response(text: &str, lines: &mut Vec<Line>, max_width: u16) {
-    let mut in_code = false;
-    for line in text.lines() {
-        if line.trim_start().starts_with("```") {
-            in_code = !in_code;
-            if in_code {
-                lines.push(Line::from(Span::styled(
-                    "┌ code ────────────────────────────────┐",
-                    Style::default().fg(Color::Yellow),
-                )));
-            } else {
-                lines.push(Line::from(Span::styled(
-                    "└──────────────────────────────────────┘",
-                    Style::default().fg(Color::Yellow),
-                )));
-            }
-            continue;
-        }
-        if in_code {
-            let w = max_width.saturating_sub(4) as usize;
-            lines.push(Line::from(vec![
-                Span::styled("│ ", Style::default().fg(Color::Yellow)),
-                Span::raw(truncate(line, w)),
+fn render_tool_line(t: &ToolLine) -> Line<'static> {
+    let (status, status_style) = match &t.status {
+        ToolStatus::Running => (
+            "...".to_string(),
+            Style::default().fg(Color::Cyan),
+        ),
+        ToolStatus::Done { ms } => (
+            format_duration(*ms),
+            Style::default().fg(Color::Green),
+        ),
+        ToolStatus::Error { msg, ms } => (
+            format!("✘ {} {}", truncate_chars(msg, 28), format_duration(*ms)),
+            Style::default().fg(Color::Red),
+        ),
+    };
+
+    let name = truncate_chars(&t.name, 10);
+    let target = truncate_chars(&t.target, 42);
+
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("{:<10}", name), Style::default().fg(Color::Cyan)),
+        Span::raw(" "),
+        Span::styled(target, Style::default().fg(Color::White)),
+        Span::raw(" "),
+        Span::styled(status, status_style),
+    ])
+}
+
+fn styled_diff_line(line: &str) -> Line<'static> {
+    let (color, text) = if line.starts_with('+') {
+        (Color::Green, format!("  │ +{}", &line[1..]))
+    } else if line.starts_with('-') {
+        (Color::Red, format!("  │ -{}", &line[1..]))
+    } else if line.starts_with('~') {
+        (Color::Yellow, format!("  │ {}", line))
+    } else {
+        (Color::DarkGray, format!("  │ {}", line))
+    };
+    Line::from(Span::styled(text, Style::default().fg(color)))
+}
+
+fn format_duration(ms: i64) -> String {
+    if ms >= 1000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{}ms", ms)
+    }
+}
+
+const SPINNER: [char; 4] = ['◐', '◓', '◑', '◒'];
+
+fn help_lines<'a>(agent_kind: &'a str, session_label: &'a str) -> Vec<Line<'a>> {
+    let mode_line = format!("  mode: {agent_kind} · session: {session_label}");
+    vec![
+        Line::from(Span::styled(
+            "  agent-engine",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::raw(mode_line)),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Enter send · Shift+Enter newline · ↑↓ scroll · Ctrl+Y copy · Esc quit",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            "  mouse drag + Cmd+C to select · /copy all · /help",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  /new  /agent build|plan|general  /thinking",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]
+}
+
+fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
+    let title = if state.thinking {
+        " running… "
+    } else {
+        " Shift+Enter: newline "
+    };
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(title, Style::default().fg(Color::DarkGray)));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut input_lines: Vec<Line> = Vec::new();
+    if state.input.is_empty() {
+        input_lines.push(Line::from(Span::styled("> ", Style::default().fg(Color::DarkGray))));
+    } else {
+        for (i, line) in state.input.lines().enumerate() {
+            let prefix = if i == 0 { "> " } else { "  " };
+            input_lines.push(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(Color::Green)),
+                Span::styled(line, Style::default().fg(Color::White)),
             ]));
-        } else {
-            let w = max_width.saturating_sub(2) as usize;
-            for wl in textwrap::fill(line, w.max(20)).lines() {
-                lines.push(Line::from(Span::raw(wl.to_string())));
-            }
         }
     }
-}
 
-fn draw_input(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
-    let prompt = format!("> {}", state.input);
-    let input = Paragraph::new(Line::from(Span::styled(
-        prompt,
-        Style::default().fg(Color::White),
-    )))
-    .block(
-        Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(Color::DarkGray)),
-    );
+    frame.render_widget(Paragraph::new(Text::from(input_lines)), inner);
 
-    frame.render_widget(input, area);
-
-    // Use display width (handles CJK, emoji, etc.)
-    let display_width = unicode_width::UnicodeWidthStr::width(state.input.as_str()) as u16;
-    let cursor_x = area.x + 2 + display_width;
-    let cursor_y = area.y + 1;
-    let max_x = area.x + area.width.saturating_sub(1);
-    frame.set_cursor_position((cursor_x.min(max_x), cursor_y));
-}
-
-fn draw_progress(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
-    if state.thinking {
-        let spinner = ['◐', '◓', '◑', '◒'][(state.spinner as usize) % 4];
-        let text = format!(" {} building...  Esc to cancel ", spinner);
-        let p = Paragraph::new(Line::from(Span::styled(
-            text,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-        )));
-        frame.render_widget(p, area);
+    if !state.thinking && state.pending_permission.is_none() {
+        let row = state.input.lines().count().saturating_sub(1) as u16;
+        let last_line = state.input.lines().last().unwrap_or("");
+        let x = inner.x + 2 + unicode_width::UnicodeWidthStr::width(last_line) as u16;
+        let y = inner.y + row.min(inner.height.saturating_sub(1));
+        frame.set_cursor_position((x.min(inner.x + inner.width.saturating_sub(1)), y));
     }
 }
 
-fn draw_status(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
-    let s = if state.thinking {
-        let ch = ['◐', '◓', '◑', '◒'][(state.spinner as usize) % 4];
-        format!(" {} {} | {} msgs | running", ch, state.agent_kind, state.messages.len())
+fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
+    let ch = SPINNER[(state.spinner as usize) % 4];
+    let cache = if state.usage_cache > 0 {
+        format!(" · cache:{}", state.usage_cache)
     } else {
-        format!(" {} | {} msgs | ready", state.agent_kind, state.messages.len())
+        String::new()
     };
+    let phase = if state.pending_permission.is_some() {
+        "permission"
+    } else if state.thinking {
+        "running"
+    } else {
+        "ready"
+    };
+    let s = format!(
+        " {} {} · {} · {}↑{}↓{} · {} · {}",
+        ch,
+        state.agent_kind,
+        state.model,
+        state.usage_in,
+        state.usage_out,
+        cache,
+        state.session_label,
+        phase,
+    );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(s, Style::default().fg(Color::DarkGray)))),
         area,
     );
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() > max && max > 3 {
-        format!("{}…", &s[..max.saturating_sub(1)])
-    } else {
-        s.to_string()
+fn draw_permission_modal(frame: &mut Frame, state: &AppState) {
+    let Some(ref perm) = state.pending_permission else {
+        return;
+    };
+
+    let area = centered_rect(62, 32, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Permission ");
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Allow tool: {}", perm.tool_name),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {}", perm.input_summary),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  y allow   n deny   Esc deny",
+            Style::default().fg(Color::Cyan),
+        )),
+    ];
+
+    frame.render_widget(Paragraph::new(text).alignment(Alignment::Left), inner);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+pub fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
     }
+    let truncated: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{}…", truncated)
 }

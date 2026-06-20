@@ -5,12 +5,17 @@ use agent_engine::agent::ProgressEvent;
 use agent_engine::git::GitManager;
 use agent_engine::prelude::*;
 use agent_engine::tools;
-use agent_engine::tui::{self, AppState};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use agent_engine::tui::{self, AppState, PermissionBridge};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
-fn build_registry(kind: AgentKind, storage: &Arc<Storage>, session_id: &str) -> Arc<ToolRegistry> {
+fn build_registry(
+    kind: AgentKind,
+    storage: &Arc<Storage>,
+    session_id: &str,
+    permission_bridge: Option<Arc<PermissionBridge>>,
+) -> Arc<ToolRegistry> {
     let mut registry = ToolRegistry::new();
     registry.register_many(tools::all_tools());
 
@@ -18,25 +23,10 @@ fn build_registry(kind: AgentKind, storage: &Arc<Storage>, session_id: &str) -> 
     let persisted_rules = storage.load_permission_rules(session_id).unwrap_or_default();
 
     let mut checker = if matches!(kind, AgentKind::Plan) {
-        DefaultPermissionChecker::from_agent(
-            def.default_allowed,
-            def.ask_patterns,
-            Some(Arc::new({
-                let storage = storage.clone();
-                let sid = session_id.to_string();
-                move |tool_name, _input| {
-                    eprintln!("Tool '{}' requires permission.", tool_name);
-                    eprint!("Allow? (y/N): ");
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input).ok();
-                    let allowed = input.trim().eq_ignore_ascii_case("y");
-                    if allowed {
-                        let _ = storage.save_permission_rule(&sid, tool_name, "allow");
-                    }
-                    allowed
-                }
-            })),
-        )
+        let approver = permission_bridge.map(|bridge| {
+            bridge.make_approver(storage.clone(), session_id.to_string())
+        });
+        DefaultPermissionChecker::from_agent(def.default_allowed, def.ask_patterns, approver)
     } else {
         let mut c = DefaultPermissionChecker::new();
         for name in &[
@@ -55,6 +45,40 @@ fn build_registry(kind: AgentKind, storage: &Arc<Storage>, session_id: &str) -> 
 
     registry = registry.with_permission_checker(Arc::new(checker));
     Arc::new(registry)
+}
+
+async fn create_agent(
+    kind: AgentKind,
+    storage: Arc<Storage>,
+    session_id: String,
+    api_key: &str,
+    progress_tx: mpsc::UnboundedSender<ProgressEvent>,
+    permission_bridge: Option<Arc<PermissionBridge>>,
+) -> Arc<Agent> {
+    let def = agent_def_for(kind);
+    let registry = build_registry(kind, &storage, &session_id, permission_bridge);
+    let workspace_dir = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let workspace_note = format!(
+        "\n\nWORKSPACE:\n- Working directory: {workspace_dir}\n- Use paths RELATIVE to this directory (e.g. Cargo.toml, src/main.rs, GOALS.md)\n- Do NOT guess absolute paths under other folders\n- Prefer `glob` first if unsure where files are"
+    );
+    Arc::new(
+        Agent::new(
+            AgentConfig {
+                kind,
+                max_iterations: 25,
+                max_tokens: 128_000,
+                compact_threshold_ratio: 0.75,
+                system_prompt: format!("{}{}", def.system_prompt, workspace_note),
+            },
+            LlmConfig::deepseek(api_key.to_string()),
+            registry,
+        )
+        .with_progress(progress_tx)
+        .with_storage(storage, session_id)
+        .await,
+    )
 }
 
 fn parse_args() -> (AgentKind, bool) {
@@ -80,12 +104,20 @@ fn parse_args() -> (AgentKind, bool) {
     (kind, new_session)
 }
 
+fn parse_agent_kind(name: &str) -> Option<AgentKind> {
+    match name {
+        "build" => Some(AgentKind::Build),
+        "plan" => Some(AgentKind::Plan),
+        "general" => Some(AgentKind::General),
+        _ => None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("error")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("error")),
         )
         .init();
 
@@ -95,7 +127,8 @@ async fn main() -> Result<(), anyhow::Error> {
     let storage = Arc::new(Storage::new()?);
     let sessions = storage.list_sessions().ok();
 
-    let (session_id, prior_messages) = if force_new || sessions.as_ref().map_or(true, |s| s.is_empty()) {
+    let (mut session_id, prior_messages) = if force_new || sessions.as_ref().map_or(true, |s| s.is_empty())
+    {
         let id = storage.create_session("New Session", &def.system_prompt, "deepseek-chat")?;
         (id, Vec::new())
     } else {
@@ -109,50 +142,40 @@ async fn main() -> Result<(), anyhow::Error> {
         (id, msgs)
     };
 
-    let registry = build_registry(agent_kind, &storage, &session_id);
     let api_key = std::env::var("DEEPSEEK_API_KEY")
         .expect("DEEPSEEK_API_KEY environment variable required");
 
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ProgressEvent>();
+    let (permission_bridge, permission_rx) = PermissionBridge::pair();
+    let permission_bridge = Arc::new(permission_bridge);
 
     let agent_cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| ".".to_string());
 
-    // Init git globally for tools
     if let Ok(gm) = GitManager::open(&agent_cwd) {
-        let gm = Arc::new(gm);
-        tools::init_git_manager(gm.clone());
+        tools::init_git_manager(Arc::new(gm));
     }
 
-    let agent = Arc::new(
-        Agent::new(
-            AgentConfig {
-                kind: agent_kind,
-                max_iterations: 10,
-                max_tokens: 128_000,
-                compact_threshold_ratio: 0.75,
-                system_prompt: def.system_prompt.clone(),
-            },
-            LlmConfig::deepseek(api_key.clone()),
-            registry,
-        )
-        .with_progress(progress_tx)
-        .with_storage(storage.clone(), session_id.clone())
-        .await,
-    );
+    let mut agent = create_agent(
+        agent_kind,
+        storage.clone(),
+        session_id.clone(),
+        &api_key,
+        progress_tx.clone(),
+        Some(permission_bridge.clone()),
+    )
+    .await;
 
-    let tui_messages = prior_messages.clone();
     if !prior_messages.is_empty() {
-        agent.load_history(prior_messages).await;
+        agent.load_history(prior_messages.clone()).await;
     }
-
-    // ── TUI ──
 
     let mut terminal = tui::setup_terminal()?;
-    let mut state = AppState::new(def.name);
+    let mut state = AppState::new(def.name, &session_id);
+    let mut current_kind = agent_kind;
 
-    for msg in &tui_messages {
+    for msg in &prior_messages {
         match msg {
             Message::User { content, .. } => {
                 for part in content {
@@ -164,14 +187,18 @@ async fn main() -> Result<(), anyhow::Error> {
             Message::Assistant { content, .. } => {
                 let text: String = content
                     .iter()
-                    .filter_map(|p| if let ContentPart::Text { text } = p { Some(text.clone()) } else { None })
+                    .filter_map(|p| {
+                        if let ContentPart::Text { text } = p {
+                            Some(text.clone())
+                        } else {
+                            None
+                        }
+                    })
                     .collect();
                 if !text.is_empty() {
                     state.messages.push(tui::ChatMessage {
                         role: "assistant".to_string(),
-                        content: text,
-                        reasoning: None,
-                        tool_calls: Vec::new(),
+                        items: vec![tui::TurnItem::Text(text)],
                         usage: None,
                     });
                 }
@@ -180,96 +207,97 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     }
 
-    loop {
-        terminal.draw(|f| tui::draw(f, &state))?;
+    'tui: loop {
+        terminal.draw(|f| tui::draw(f, &mut state))?;
 
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            match key.code {
-                KeyCode::Char(c) => state.input.push(c),
-                KeyCode::Backspace => { state.input.pop(); }
-                KeyCode::Esc => break,
-                KeyCode::Enter => {
-                    let input = state.input.trim().to_string();
-                    state.input.clear();
-
-                    if input.eq_ignore_ascii_case("quit") || input.eq_ignore_ascii_case("exit") || input == "/quit" {
-                        break;
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if state.has_pending_permission() {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => state.respond_permission(true),
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            state.respond_permission(false)
+                        }
+                        _ => {}
                     }
-                    if input.is_empty() {
+                    continue;
+                }
+
+                if state.thinking {
+                    if tui::try_copy_key(&mut state, key.code, key.modifiers) {
+                        terminal.draw(|f| tui::draw(f, &mut state))?;
                         continue;
                     }
-
-                    state.add_user_message(&input);
-                    state.thinking = true;
-                    state.live_events.clear();
-
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let agent = agent.clone();
-
-                    tokio::spawn(async move {
-                        let result = agent.run(&input).await;
-                        let _ = tx.send(result);
-                    });
-
-                    let mut rx = rx;
-                    let mut cancelled = false;
-                    loop {
-                        tokio::select! {
-                            ev = progress_rx.recv() => {
-                                if let Some(ev) = ev {
-                                    handle_progress_event(&mut state, &ev);
-                                }
-                                while let Ok(ev) = progress_rx.try_recv() {
-                                    handle_progress_event(&mut state, &ev);
-                                }
-                                state.spinner += 1;
-                                terminal.draw(|f| tui::draw(f, &state))?;
-                            }
-                            result = &mut rx => {
-                                match result {
-                                    Ok(Ok(output)) => {
-                                        state.add_agent_message(&output);
-                                    }
-                                    Ok(Err(e)) => {
-                                        state.live_events.push(format!("✘ error: {}", e));
-                                        state.thinking = false;
-                                    }
-                                    Err(_) => {
-                                        state.thinking = false;
-                                    }
-                                }
-                                terminal.draw(|f| tui::draw(f, &state))?;
-                                break;
-                            }
-                            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                                // Check for ESC key during execution
-                                if crossterm::event::poll(std::time::Duration::from_secs(0)).unwrap_or(false) {
-                                    if let crossterm::event::Event::Key(key) = crossterm::event::read().unwrap() {
-                                        if key.code == KeyCode::Esc && key.kind == KeyEventKind::Press {
-                                            cancelled = true;
-                                            state.thinking = false;
-                                            state.live_events.push("✘ cancelled".to_string());
-                                        }
-                                    }
-                                }
-                                state.spinner += 1;
-                                terminal.draw(|f| tui::draw(f, &state))?;
-                            }
-                        }
-                        if cancelled {
-                            break;
-                        }
-                    }
+                    tui::handle_scroll_key(&mut state, key.code, key.modifiers);
+                    continue;
                 }
-                KeyCode::Up => state.scroll = state.scroll.saturating_sub(1),
-                KeyCode::Down => state.scroll = state.scroll.saturating_add(1),
-                KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(10),
-                KeyCode::PageDown => state.scroll = state.scroll.saturating_add(10),
-                _ => {}
+
+                match key.code {
+                    KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        tui::try_copy_key(&mut state, key.code, key.modifiers);
+                        terminal.draw(|f| tui::draw(f, &mut state))?;
+                    }
+                    KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        tui::scroll_to_bottom(&mut state);
+                    }
+                    KeyCode::Char(c) => state.input.push(c),
+                    KeyCode::Backspace => {
+                        state.input.pop();
+                    }
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        state.input.push('\n');
+                    }
+                    KeyCode::Enter => {
+                        let input = state.input.trim().to_string();
+                        state.input.clear();
+
+                        if input.is_empty() {
+                            continue;
+                        }
+
+                        if input.starts_with('/') {
+                            if handle_slash_command(
+                                &input,
+                                &mut state,
+                                &mut agent,
+                                &mut current_kind,
+                                &storage,
+                                &mut session_id,
+                                &api_key,
+                                &progress_tx,
+                                &permission_bridge,
+                            )
+                            .await?
+                            {
+                                break 'tui;
+                            }
+                            continue;
+                        }
+
+                        state.add_user_message(&input);
+                        run_agent_turn(
+                            &mut terminal,
+                            &mut state,
+                            &agent,
+                            &input,
+                            &mut progress_rx,
+                            &permission_rx,
+                        )
+                        .await?;
+                    }
+                    KeyCode::Esc => break 'tui,
+                    KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End => {
+                        tui::handle_scroll_key(&mut state, key.code, key.modifiers);
+                    }
+                    _ => {}
+                }
             }
+            _ => {}
         }
     }
 
@@ -277,116 +305,186 @@ async fn main() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn handle_progress_event(state: &mut AppState, ev: &ProgressEvent) {
-    match ev {
-        ProgressEvent::Token { text } => {
-            state.streaming_text.push_str(text);
+async fn handle_slash_command(
+    input: &str,
+    state: &mut AppState,
+    agent: &mut Arc<Agent>,
+    current_kind: &mut AgentKind,
+    storage: &Arc<Storage>,
+    session_id: &mut String,
+    api_key: &str,
+    progress_tx: &mpsc::UnboundedSender<ProgressEvent>,
+    permission_bridge: &Arc<PermissionBridge>,
+) -> Result<bool, anyhow::Error> {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    let cmd = parts.first().copied().unwrap_or("");
+
+    match cmd {
+        "/quit" | "/exit" | "/q" => return Ok(true),
+        "/help" => {
+            state.add_system_message(
+                "/quit · /new · /copy · /copy all · /agent build|plan|general · /thinking · Ctrl+Y",
+            );
         }
-        ProgressEvent::ToolCallStarted { name, input, ts } => {
-            state.tool_starts.insert(name.clone(), *ts);
-            let s = format_tool_start(name, input);
-            if !s.is_empty() {
-                state.live_events.push(s);
+        "/copy" => {
+            let sub = parts.get(1).copied().unwrap_or("");
+            let result = if sub == "all" {
+                state.copy_conversation()
+            } else {
+                state.copy_last_assistant()
+            };
+            match result {
+                Ok(n) => state.add_system_message(&format!("Copied ({n} bytes).")),
+                Err(e) => state.add_system_message(&format!("Copy failed: {e}")),
             }
         }
-        ProgressEvent::ToolCallFinished { name, status, error, ts } => {
-            let duration = state.tool_starts.remove(name).map(|start| *ts - start);
-            let s = format_tool_end(name, status, error, duration);
-            if !s.is_empty() {
-                state.live_events.push(s);
+        "/thinking" => {
+            state.show_reasoning = !state.show_reasoning;
+            state.add_system_message(if state.show_reasoning {
+                "Thinking blocks visible."
+            } else {
+                "Thinking blocks hidden."
+            });
+        }
+        "/new" | "/clear" => {
+            let def = agent_def_for(*current_kind);
+            let id = storage.create_session("New Session", &def.system_prompt, "deepseek-chat")?;
+            *session_id = id.clone();
+            *agent = create_agent(
+                *current_kind,
+                storage.clone(),
+                id.clone(),
+                api_key,
+                progress_tx.clone(),
+                Some(permission_bridge.clone()),
+            )
+            .await;
+            state.messages.clear();
+            state.session_label = if id.len() > 8 {
+                id[..8].to_string()
+            } else {
+                id
+            };
+            state.add_system_message("New session.");
+        }
+        "/agent" => {
+            let name = parts.get(1).copied().unwrap_or("");
+            if let Some(kind) = parse_agent_kind(name) {
+                let def = agent_def_for(kind);
+                *current_kind = kind;
+                state.agent_kind = def.name.to_string();
+                let msgs = storage.load_session_messages(session_id).unwrap_or_default();
+                *agent = create_agent(
+                    kind,
+                    storage.clone(),
+                    session_id.clone(),
+                    api_key,
+                    progress_tx.clone(),
+                    Some(permission_bridge.clone()),
+                )
+                .await;
+                if !msgs.is_empty() {
+                    agent.load_history(msgs).await;
+                }
+                state.add_system_message(&format!("Switched to {} mode.", def.name));
+            } else {
+                state.add_system_message("Usage: /agent build|plan|general");
             }
         }
         _ => {
-            let s = event_to_string(ev);
-            for line in s.lines() {
-                if !line.is_empty() {
-                    state.live_events.push(line.to_string());
+            state.add_system_message(&format!("Unknown: {}. Try /help", cmd));
+        }
+    }
+    Ok(false)
+}
+
+async fn run_agent_turn(
+    terminal: &mut tui::AppTerminal,
+    state: &mut AppState,
+    agent: &Arc<Agent>,
+    input: &str,
+    progress_rx: &mut mpsc::UnboundedReceiver<ProgressEvent>,
+    permission_rx: &std::sync::mpsc::Receiver<tui::PermissionRequest>,
+) -> Result<(), anyhow::Error> {
+    state.begin_turn();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let agent = agent.clone();
+    let input = input.to_string();
+    tokio::spawn(async move {
+        let result = agent.run(&input).await;
+        let _ = tx.send(result);
+    });
+
+    let mut rx = rx;
+    loop {
+        while let Ok(req) = permission_rx.try_recv() {
+            state.take_permission_request(req);
+        }
+
+        tui::poll_scroll_input(state);
+
+        tokio::select! {
+            ev = progress_rx.recv() => {
+                if let Some(ev) = ev {
+                    state.apply_progress(&ev);
                 }
-            }
-        }
-    }
-}
-
-fn format_tool_start(name: &str, input: &str) -> String {
-    let arrow = match name {
-        "read" => "→",
-        "write" | "edit" => "←",
-        "bash" => "$",
-        "glob" | "grep" => "✱",
-        "webfetch" | "websearch" => "🌐",
-        "undo" => "↩",
-        _ => "→",
-    };
-    // Extract path or command from input for cleaner display
-    let summary = if name == "bash" {
-        input.trim().trim_matches('"').to_string()
-    } else if let Some(path) = input.split("\"path\":\"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-    {
-        path.to_string()
-    } else {
-        let trimmed = input.trim().trim_matches('"');
-        truncate_utf8(trimmed, 60)
-    };
-    format!("{} {} {}", arrow, name, summary)
-}
-
-fn format_tool_end(name: &str, status: &str, error: &Option<String>, duration: Option<i64>) -> String {
-    let ms = duration.map(|d| format!("+{}ms", d)).unwrap_or_default();
-    if status == "error" {
-        let msg = error.as_deref().unwrap_or("failed");
-        let short = if msg.len() > 60 { format!("{}...", &msg[..60]) } else { msg.to_string() };
-        format!("  ✗ {} — {} ({})", name, short, ms)
-    } else {
-        String::new() // success is shown by the start line
-    }
-}
-
-fn truncate_utf8(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &s[..end])
-}
-
-fn event_to_string(ev: &ProgressEvent) -> String {
-    match ev {
-        ProgressEvent::Token { .. } => unreachable!(),
-        ProgressEvent::LlmCall { .. } => String::new(),
-        ProgressEvent::ToolCallStarted { name, input, .. } => {
-            let arrow = match name.as_str() {
-                "read" => "→",
-                "write" | "edit" => "←",
-                "bash" => "$",
-                "glob" => "✱",
-                "grep" => "✱",
-                "webfetch" | "websearch" => "🌐",
-                "undo" => "↩",
-                _ => "→",
-            };
-            format!("{} {} {}", arrow, name, input)
-        }
-        ProgressEvent::DiffAvailable { diff } => {
-            let mut s = String::new();
-            for line in diff.lines().take(30) {
-                if line.starts_with('+') {
-                    s.push_str(&format!("+{}\n", &line[1..]));
-                } else if line.starts_with('-') {
-                    s.push_str(&format!("-{}\n", &line[1..]));
-                } else if line.starts_with('~') {
-                    s.push_str(&format!("~{}\n", &line[1..]));
+                while let Ok(ev) = progress_rx.try_recv() {
+                    state.apply_progress(&ev);
                 }
+                state.spinner += 1;
+                terminal.draw(|f| tui::draw(f, state))?;
             }
-            if diff.lines().count() > 30 {
-                s.push_str("...\n");
+            result = &mut rx => {
+                while let Ok(req) = permission_rx.try_recv() {
+                    state.take_permission_request(req);
+                }
+                match result {
+                    Ok(Ok(output)) => state.add_agent_message(&output),
+                    Ok(Err(e)) => state.push_turn_error(&e.to_string()),
+                    Err(_) => state.push_turn_error("agent task interrupted"),
+                }
+                terminal.draw(|f| tui::draw(f, state))?;
+                break;
             }
-            s
+            _ = tokio::time::sleep(Duration::from_millis(80)) => {
+                while let Ok(req) = permission_rx.try_recv() {
+                    state.take_permission_request(req);
+                }
+                tui::poll_scroll_input(state);
+                if state.has_pending_permission() {
+                    poll_permission_keys(terminal, state)?;
+                }
+                state.spinner += 1;
+                terminal.draw(|f| tui::draw(f, state))?;
+            }
         }
-        _ => String::new(),
+
+        if !state.thinking {
+            break;
+        }
     }
+    Ok(())
+}
+
+fn poll_permission_keys(
+    terminal: &mut tui::AppTerminal,
+    state: &mut AppState,
+) -> Result<(), anyhow::Error> {
+    while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
+        if let Event::Key(key) = event::read()? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => state.respond_permission(true),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    state.respond_permission(false)
+                }
+                _ => {}
+            }
+        }
+    }
+    terminal.draw(|f| tui::draw(f, state))?;
+    Ok(())
 }

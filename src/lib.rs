@@ -1,3 +1,5 @@
+mod markdown_render;
+
 pub mod agent;
 pub mod context;
 pub mod git;

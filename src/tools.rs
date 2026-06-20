@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -23,6 +24,49 @@ pub fn get_git_manager() -> Option<&'static Arc<GitManager>> {
     GIT_MANAGER.get()
 }
 
+/// Resolve tool paths against the process cwd. Falls back to basename when the LLM
+/// hallucinates a wrong absolute path (common on the first exploration step).
+pub fn resolve_tool_path(path: &str) -> Result<PathBuf, ToolError> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(ToolError::InvalidInput("path is required".into()));
+    }
+
+    let cwd = std::env::current_dir().map_err(|e| {
+        ToolError::Execution(format!("Cannot get working directory: {e}"))
+    })?;
+
+    let direct = {
+        let p = Path::new(path);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        }
+    };
+
+    if direct.is_file() || direct.is_dir() {
+        return Ok(direct);
+    }
+
+    if Path::new(path).is_absolute() {
+        if let Some(name) = Path::new(path).file_name() {
+            let fallback = cwd.join(name);
+            if fallback.is_file() || fallback.is_dir() {
+                return Ok(fallback);
+            }
+        }
+    }
+
+    Err(ToolError::Execution(format!(
+        "File not found: {path} (cwd: {}) — use relative paths like Cargo.toml or src/main.rs",
+        cwd.display()
+    )))
+}
+
+const PATH_SCHEMA_DESC: &str =
+    "Path relative to the project working directory (e.g. Cargo.toml, src/main.rs)";
+
 // ── Read Tool ──
 
 pub struct ReadTool;
@@ -40,23 +84,24 @@ impl Tool for ReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path to the file"
+                    "description": PATH_SCHEMA_DESC
                 }
             },
             "required": ["path"]
         })
     }
     fn execute(&self, input: Value, _ctx: ToolContext) -> BoxFuture<'static, ToolResult<ToolOutput>> {
-        let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let path_raw = input.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
         Box::pin(async move {
-            if path.is_empty() {
-                return Err(ToolError::InvalidInput("path is required".into()));
-            }
+            let path = resolve_tool_path(&path_raw)?;
             match tokio::fs::read_to_string(&path).await {
                 Ok(content) => Ok(ToolOutput {
                     content: vec![ToolContent::Text { text: content }],
                 }),
-                Err(e) => Err(ToolError::Execution(format!("Read error: {}", e))),
+                Err(e) => Err(ToolError::Execution(format!(
+                    "Read error ({}): {e}",
+                    path.display()
+                ))),
             }
         })
     }
@@ -82,7 +127,7 @@ impl Tool for WriteTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path to the file"
+                    "description": PATH_SCHEMA_DESC
                 },
                 "content": {
                     "type": "string",
@@ -93,19 +138,20 @@ impl Tool for WriteTool {
         })
     }
     fn execute(&self, input: Value, _ctx: ToolContext) -> BoxFuture<'static, ToolResult<ToolOutput>> {
-        let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let path_raw = input.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let content = input.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
         Box::pin(async move {
-            if path.is_empty() {
-                return Err(ToolError::InvalidInput("path is required".into()));
-            }
+            let path = resolve_tool_path(&path_raw)?;
             match tokio::fs::write(&path, &content).await {
                 Ok(()) => Ok(ToolOutput {
                     content: vec![ToolContent::Text {
-                        text: format!("Successfully wrote {} bytes to {}", content.len(), path),
+                        text: format!("Successfully wrote {} bytes to {}", content.len(), path.display()),
                     }],
                 }),
-                Err(e) => Err(ToolError::Execution(format!("Write error: {}", e))),
+                Err(e) => Err(ToolError::Execution(format!(
+                    "Write error ({}): {e}",
+                    path.display()
+                ))),
             }
         })
     }
@@ -131,7 +177,7 @@ impl Tool for EditTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path to the file"
+                    "description": PATH_SCHEMA_DESC
                 },
                 "old": {
                     "type": "string",
@@ -146,19 +192,22 @@ impl Tool for EditTool {
         })
     }
     fn execute(&self, input: Value, _ctx: ToolContext) -> BoxFuture<'static, ToolResult<ToolOutput>> {
-        let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let path_raw = input.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let old = input.get("old").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let new = input.get("new").and_then(|v| v.as_str()).unwrap_or("").to_string();
         Box::pin(async move {
-            if path.is_empty() {
-                return Err(ToolError::InvalidInput("path is required".into()));
-            }
             if old.is_empty() {
                 return Err(ToolError::InvalidInput("old string is required".into()));
             }
+            let path = resolve_tool_path(&path_raw)?;
+            let path_display = path.display().to_string();
             let content = match tokio::fs::read_to_string(&path).await {
                 Ok(c) => c,
-                Err(e) => return Err(ToolError::Execution(format!("Read error: {}", e))),
+                Err(e) => {
+                    return Err(ToolError::Execution(format!(
+                        "Read error ({path_display}): {e}"
+                    )))
+                }
             };
 
             // Try exact match first
@@ -177,8 +226,7 @@ impl Tool for EditTool {
                     } else {
                         let preview = content.lines().take(5).collect::<Vec<_>>().join("\n");
                         return Err(ToolError::Execution(format!(
-                            "Could not find text in {}. First 5 lines:\n{}",
-                            path, preview
+                            "Could not find text in {path_display}. First 5 lines:\n{preview}",
                         )));
                     }
                 }
@@ -191,7 +239,7 @@ impl Tool for EditTool {
                 Ok(()) => {
                     let old_lines: Vec<&str> = old.lines().collect();
                     let new_lines: Vec<&str> = new.lines().collect();
-                    let mut diff_text = format!("Edit {}\n", path);
+                    let mut diff_text = format!("Edit {path_display}\n");
                     let context_before = content[..pos].lines().last().unwrap_or("");
                     if !context_before.is_empty() {
                         diff_text.push_str(&format!("    {}\n", context_before));

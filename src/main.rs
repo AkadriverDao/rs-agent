@@ -84,7 +84,7 @@ async fn create_agent(
 fn parse_args() -> (AgentKind, bool) {
     let args: Vec<String> = std::env::args().collect();
     let mut kind = AgentKind::Build;
-    let mut new_session = false;
+    let mut continue_session = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -96,12 +96,13 @@ fn parse_args() -> (AgentKind, bool) {
                     _ => AgentKind::Build,
                 };
             }
-            "--new" | "-n" => new_session = true,
+            "--continue" | "-c" => continue_session = true,
+            "--new" | "-n" => continue_session = false,
             _ => {}
         }
         i += 1;
     }
-    (kind, new_session)
+    (kind, continue_session)
 }
 
 fn parse_agent_kind(name: &str) -> Option<AgentKind> {
@@ -121,26 +122,26 @@ async fn main() -> Result<(), anyhow::Error> {
         )
         .init();
 
-    let (agent_kind, force_new) = parse_args();
+    let (agent_kind, continue_session) = parse_args();
     let def = agent_def_for(agent_kind);
 
     let storage = Arc::new(Storage::new()?);
     let sessions = storage.list_sessions().ok();
 
-    let (mut session_id, prior_messages) = if force_new || sessions.as_ref().map_or(true, |s| s.is_empty())
-    {
-        let id = storage.create_session("New Session", &def.system_prompt, "deepseek-chat")?;
-        (id, Vec::new())
-    } else {
-        let s = sessions.unwrap();
-        let id = s[0].id.clone();
-        let msgs = if s[0].message_count > 0 {
-            storage.load_session_messages(&id).unwrap_or_default()
+    let (mut session_id, prior_messages) =
+        if continue_session && sessions.as_ref().is_some_and(|s| !s.is_empty()) {
+            let s = sessions.unwrap();
+            let id = s[0].id.clone();
+            let msgs = if s[0].message_count > 0 {
+                storage.load_session_messages(&id).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            (id, msgs)
         } else {
-            Vec::new()
+            let id = storage.create_session("New Session", &def.system_prompt, "deepseek-chat")?;
+            (id, Vec::new())
         };
-        (id, msgs)
-    };
 
     let api_key = std::env::var("DEEPSEEK_API_KEY")
         .expect("DEEPSEEK_API_KEY environment variable required");
@@ -332,7 +333,7 @@ async fn handle_slash_command(
                 Some(permission_bridge.clone()),
             )
             .await;
-            state.messages.clear();
+            state.clear_conversation();
             state.session_label = if id.len() > 8 {
                 id[..8].to_string()
             } else {

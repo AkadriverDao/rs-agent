@@ -63,6 +63,7 @@ void printArray(int arr[], int n) {
 }
 
 int main() {
+    // --- QuickSort demo ---
     int arr[] = {64, 34, 25, 12, 22, 11, 90};
     int n = sizeof(arr) / sizeof(arr[0]);
 
@@ -73,6 +74,19 @@ int main() {
 
     std::cout << "Sorted array: ";
     printArray(arr, n);
+
+    // --- BFS demo ---
+    // Graph with 6 nodes (0..5)
+    std::vector<std::vector<int>> graph = {
+        {1, 2},       // node 0 connected to 1, 2
+        {0, 3, 4},    // node 1 connected to 0, 3, 4
+        {0, 4},       // node 2 connected to 0, 4
+        {1, 5},       // node 3 connected to 1, 5
+        {1, 2, 5},    // node 4 connected to 1, 2, 5
+        {3, 4}        // node 5 connected to 3, 4
+    };
+
+    bfs(graph, 0);
 
     return 0;
 }

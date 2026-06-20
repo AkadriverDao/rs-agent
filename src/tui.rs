@@ -273,6 +273,14 @@ impl AppState {
         self.tool_starts.clear();
     }
 
+    pub fn clear_conversation(&mut self) {
+        self.messages.clear();
+        self.scroll = usize::MAX;
+        self.thinking = false;
+        self.active_turn = None;
+        self.tool_starts.clear();
+    }
+
     pub fn add_user_message(&mut self, text: &str) {
         self.messages.push(ChatMessage {
             role: "user".to_string(),
@@ -307,10 +315,21 @@ impl AppState {
 
         let has_text = items.iter().any(|i| matches!(i, TurnItem::Text(t) if !t.is_empty()));
         if !output.text.is_empty() {
+            // Replace streamed partial text with the complete final response.
+            if let Some(TurnItem::Text(buf)) = items.last_mut() {
+                if output.text.starts_with(buf.as_str()) && output.text.len() > buf.len() {
+                    *buf = output.text.clone();
+                }
+            }
+
             let final_text = output.text.trim();
             // Append final answer after tool blocks (OpenCode order: tools → conclusion)
             let already_shown = items.iter().any(|i| {
-                matches!(i, TurnItem::Text(t) if t.trim() == final_text || t.ends_with(final_text))
+                matches!(i, TurnItem::Text(t) if {
+                    let trimmed = t.trim();
+                    trimmed == final_text
+                        || (trimmed.len() >= final_text.len() && trimmed.ends_with(final_text))
+                })
             });
             if !already_shown {
                 items.push(TurnItem::Text(output.text.clone()));
@@ -564,8 +583,13 @@ fn extract_tool_target(name: &str, input: &str) -> String {
 pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // Do not capture mouse — allows terminal native select + Cmd+C copy.
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+    // Alternate screen + clear: isolated TUI, no cargo output or prior scrollback mixed in.
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::cursor::MoveTo(0, 0),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+    )?;
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
@@ -1098,7 +1122,7 @@ fn help_lines<'a>(agent_kind: &'a str, session_label: &'a str) -> Vec<Line<'a>> 
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
-            "  /new  /agent build|plan|general  /thinking",
+            "  /new  /agent build|plan|general  /thinking  ·  cargo run --continue",
             Style::default().fg(Color::DarkGray),
         )),
     ]

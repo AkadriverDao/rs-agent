@@ -433,6 +433,12 @@ impl Agent {
                                     }).await;
                                 }
                             }
+                            // Emit diff after auto-commit to show what changed
+                            if let Ok(diff) = git.diff_uncommitted() {
+                                if !diff.is_empty() {
+                                    self.emit(ProgressEvent::DiffAvailable { diff }).await;
+                                }
+                            }
                         }
                     }
                 }

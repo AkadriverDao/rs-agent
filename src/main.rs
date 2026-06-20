@@ -465,16 +465,13 @@ async fn handle_slash_command(
             state.add_system_message("New session.");
         }
         "/clear" => {
-            // Clear the terminal screen (like shell's clear command)
-            use std::io::Write;
-            write!(
-                std::io::stdout(),
-                "{}{}",
-                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                crossterm::cursor::MoveTo(0, 0),
-            )?;
-            std::io::stdout().flush()?;
-            state.add_system_message("Screen cleared.");
+            // Clear only the conversation messages, keep input area and status bar intact
+            state.messages.clear();
+            state.scroll = usize::MAX;
+            state.thinking = false;
+            state.active_turn = None;
+            state.tool_starts.clear();
+            state.add_system_message("Conversation cleared.");
         }
         "/agent" => {
             let name = parts.get(1).copied().unwrap_or("");

@@ -1,8 +1,10 @@
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
 };
 use unicode_width::UnicodeWidthStr;
+
+use crate::theme;
 
 const INDENT: &str = "  ";
 
@@ -96,7 +98,7 @@ pub fn render_markdown(text: &str, out: &mut Vec<Line>, max_width: u16) {
             continue;
         }
 
-        out.extend(wrap_inline_line(line, width, Style::default().fg(Color::White)));
+        out.extend(wrap_inline_line(line, width, theme::body()));
         i += 1;
     }
 
@@ -199,37 +201,25 @@ fn render_hr(out: &mut Vec<Line>, width: usize) {
     let w = width.min(60);
     out.push(Line::from(Span::styled(
         format!("{}{}", INDENT, "─".repeat(w)),
-        Style::default().fg(Color::DarkGray),
+        theme::muted(),
     )));
 }
 
 fn render_heading(out: &mut Vec<Line>, level: usize, title: &str, width: usize) {
-    let style = match level {
-        1 => Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-        2 => Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-        _ => Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    };
+    let style = theme::heading(level);
     out.extend(wrap_inline_line(title, width, style));
     if level <= 2 {
         let underline_len = display_width(title).min(width);
         out.push(Line::from(Span::styled(
             format!("{}{}", INDENT, "─".repeat(underline_len)),
-            Style::default().fg(Color::DarkGray),
+            theme::muted(),
         )));
     }
     out.push(Line::from(""));
 }
 
 fn render_blockquote(out: &mut Vec<Line>, text: &str, width: usize) {
-    let style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::ITALIC);
+    let style = theme::dim().add_modifier(Modifier::ITALIC);
     let prefix = "  │ ";
     let quote_width = width.saturating_sub(display_width(prefix));
     let wrapped = wrap_inline_line_prefixed(text, quote_width, style, prefix, prefix);
@@ -243,7 +233,7 @@ fn render_list_item(out: &mut Vec<Line>, ordered: Option<u32>, text: &str, width
     };
     let first_prefix = format!("{}{}", INDENT, bullet);
     let cont_prefix = format!("{}{}", INDENT, " ".repeat(display_width(&bullet)));
-    let style = Style::default().fg(Color::White);
+    let style = theme::body();
     let wrapped = wrap_inline_words(
         inline_words(text, style),
         width,
@@ -252,7 +242,7 @@ fn render_list_item(out: &mut Vec<Line>, ordered: Option<u32>, text: &str, width
     );
     for (idx, mut line) in wrapped.into_iter().enumerate() {
         if idx == 0 && !line.spans.is_empty() {
-            line.spans[0] = Span::styled(first_prefix.clone(), Style::default().fg(Color::Cyan));
+            line.spans[0] = Span::styled(first_prefix.clone(), theme::list_marker());
         }
         out.push(line);
     }
@@ -266,20 +256,20 @@ pub fn render_code_block(lang: &Option<String>, lines: &[String], out: &mut Vec<
         .unwrap_or_else(|| " code ".to_string());
     out.push(Line::from(Span::styled(
         format!("  ┌{label}{}", "─".repeat(28)),
-        Style::default().fg(Color::Yellow),
+        theme::code_border(),
     )));
     let w = max_width.saturating_sub(6) as usize;
     for line in lines {
         for chunk in wrap_line_chunks(line, w) {
             out.push(Line::from(vec![
-                Span::styled("  │ ", Style::default().fg(Color::Yellow)),
-                Span::styled(chunk, Style::default().fg(Color::Gray)),
+                Span::styled("  │ ", theme::code_border()),
+                Span::styled(chunk, theme::code_body()),
             ]));
         }
     }
     out.push(Line::from(Span::styled(
         "  └────────────────────────────────────",
-        Style::default().fg(Color::Yellow),
+        theme::code_border(),
     )));
     out.push(Line::from(""));
 }
@@ -340,11 +330,9 @@ fn render_table(rows: &[Vec<String>], out: &mut Vec<Line>, width: usize) {
         shrink_columns(&mut col_widths, width.saturating_sub(border_overhead));
     }
 
-    let border_style = Style::default().fg(Color::Cyan);
-    let header_style = Style::default()
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
-    let cell_style = Style::default().fg(Color::White);
+    let border_style = theme::muted();
+    let header_style = theme::body().add_modifier(Modifier::BOLD);
+    let cell_style = theme::body();
 
     out.push(Line::from(Span::styled(
         format!("  {}", table_border(&col_widths, '┌', '┬', '┐')),
@@ -378,7 +366,7 @@ fn table_border(widths: &[usize], left: char, mid: char, right: char) -> String 
 }
 
 fn table_row_line(row: &[String], widths: &[usize], style: Style) -> Line<'static> {
-    let border = Style::default().fg(Color::Cyan);
+    let border = theme::muted();
     let mut spans = vec![Span::raw("  ".to_string())];
     for (i, w) in widths.iter().enumerate() {
         let cell = row.get(i).map(String::as_str).unwrap_or("");
@@ -551,7 +539,7 @@ fn parse_inline_rest(rest: &str, style: Style, out: &mut Vec<StyledWord>) {
         for word in code.split_whitespace() {
             out.push(StyledWord {
                 text: word.to_string(),
-                style: Style::default().fg(Color::Yellow),
+                style: theme::inline_code(),
             });
         }
     }
@@ -601,13 +589,11 @@ fn parse_inline_rest(rest: &str, style: Style, out: &mut Vec<StyledWord>) {
             if let Some((link, consumed)) = parse_link_prefix(rest) {
                 out.push(StyledWord {
                     text: link.label,
-                    style: style
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::UNDERLINED),
+                    style: theme::status_accent().add_modifier(Modifier::UNDERLINED),
                 });
                 out.push(StyledWord {
                     text: format!("({})", link.url),
-                    style: Style::default().fg(Color::DarkGray),
+                    style: theme::muted(),
                 });
                 rest = &rest[consumed..];
                 continue;
@@ -702,9 +688,9 @@ mod tests {
     #[test]
     fn rs_files_use_plain_style_not_hidden() {
         let mut words = Vec::new();
-        parse_inline("`tool.rs`", Style::default().fg(Color::White), &mut words);
+        parse_inline("`tool.rs`", theme::body(), &mut words);
         assert_eq!(words.len(), 1);
         assert_eq!(words[0].text, "tool.rs");
-        assert_eq!(words[0].style.fg, Some(Color::White));
+        assert_eq!(words[0].style.fg, theme::body().fg);
     }
 }

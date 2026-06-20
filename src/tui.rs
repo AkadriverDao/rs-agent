@@ -1,11 +1,10 @@
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::{
-    backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph},
-    Frame, Terminal,
+    Frame,
 };
 use std::io;
 use std::sync::mpsc;
@@ -13,6 +12,7 @@ use std::time::Duration;
 
 use crate::agent::{AgentOutput, ProgressEvent};
 use crate::markdown_render::{render_code_block, render_markdown};
+use crate::theme;
 use crate::types::{ContentPart, Message, ToolResultValue};
 
 // ── Turn timeline (OpenCode-style chronological blocks) ──
@@ -578,27 +578,54 @@ fn extract_tool_target(name: &str, input: &str) -> String {
     truncate_chars(input.trim().trim_matches('"'), 50)
 }
 
-// ── Terminal setup ──
+// ── Terminal setup (OpenCode-style: alternate screen before any other work) ──
 
-pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
-    crossterm::terminal::enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    // Alternate screen + clear: isolated TUI, no cargo output or prior scrollback mixed in.
+pub type AppTerminal = ratatui::DefaultTerminal;
+
+/// Enter alternate screen + raw mode immediately (like OpenCode `tea.WithAltScreen()`).
+pub fn setup_terminal() -> io::Result<AppTerminal> {
+    // Drop main-buffer scrollback (cargo output) before switching buffers.
     crossterm::execute!(
-        stdout,
-        crossterm::terminal::EnterAlternateScreen,
+        io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
         crossterm::cursor::MoveTo(0, 0),
+    )?;
+    let mut terminal = ratatui::try_init()?;
+    // Capture the mouse so wheel events scroll the TUI, not terminal scrollback.
+    crossterm::execute!(
+        io::stdout(),
+        crossterm::event::EnableMouseCapture,
+        crossterm::cursor::Hide,
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
     )?;
-    Terminal::new(CrosstermBackend::new(stdout))
+    terminal.clear()?;
+    Ok(terminal)
 }
 
-pub type AppTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+pub fn restore_terminal() {
+    let _ = crossterm::execute!(
+        io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::cursor::Show,
+    );
+    ratatui::restore();
+}
 
-pub fn restore_terminal() -> io::Result<()> {
-    crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
-    Ok(())
+/// Full-screen splash while storage/agent initializes.
+pub fn draw_boot(frame: &mut Frame, message: &str) {
+    frame.render_widget(Clear, frame.area());
+    let area = frame.area();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::muted())
+        .title(Span::styled(
+            " agent-engine ",
+            theme::status_accent().add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(message).style(theme::body()), inner);
 }
 
 pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
@@ -828,15 +855,33 @@ pub fn try_copy_key(state: &mut AppState, code: KeyCode, modifiers: KeyModifiers
     false
 }
 
+pub fn handle_scroll_mouse(state: &mut AppState, kind: MouseEventKind) -> bool {
+    match kind {
+        MouseEventKind::ScrollUp => {
+            scroll_up(state, 3);
+            true
+        }
+        MouseEventKind::ScrollDown => {
+            scroll_down(state, 3);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Poll scroll keys without blocking (safe during agent runs).
 pub fn poll_scroll_input(state: &mut AppState) {
     while event::poll(Duration::from_millis(0)).unwrap_or(false) {
-        if let Ok(Event::Key(key)) = event::read() {
-            if key.kind == KeyEventKind::Press
-                && !try_copy_key(state, key.code, key.modifiers)
-            {
-                handle_scroll_key(state, key.code, key.modifiers);
+        match event::read() {
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                if !try_copy_key(state, key.code, key.modifiers) {
+                    handle_scroll_key(state, key.code, key.modifiers);
+                }
             }
+            Ok(Event::Mouse(m)) => {
+                handle_scroll_mouse(state, m.kind);
+            }
+            _ => {}
         }
     }
 }
@@ -844,11 +889,12 @@ pub fn poll_scroll_input(state: &mut AppState) {
 // ── Draw ──
 
 pub fn draw(frame: &mut Frame, state: &mut AppState) {
+    let input_h = input_area_height(state);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(5),
+            Constraint::Length(input_h),
             Constraint::Length(1),
         ])
         .split(frame.area());
@@ -860,6 +906,16 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
     if state.pending_permission.is_some() {
         draw_permission_modal(frame, state);
     }
+}
+
+fn input_area_height(state: &AppState) -> u16 {
+    // top border (1) + content lines
+    let content = if state.thinking {
+        1
+    } else {
+        state.input.lines().count().max(1).min(4)
+    };
+    (content as u16).saturating_add(1)
 }
 
 fn draw_messages(frame: &mut Frame, area: Rect, state: &mut AppState) {
@@ -915,7 +971,7 @@ fn build_message_lines<'a>(
                 let sp = SPINNER[(spinner as usize) % 4];
                 lines.push(Line::from(Span::styled(
                     format!("{} working…", sp),
-                    Style::default().fg(Color::Cyan),
+                    theme::tool_running(),
                 )));
             } else {
                 render_turn_items(&turn.items, &mut lines, width, show_reasoning);
@@ -935,12 +991,13 @@ fn build_message_lines<'a>(
 fn render_message(msg: &ChatMessage, lines: &mut Vec<Line>, width: u16, show_reasoning: bool) {
     match msg.role.as_str() {
         "user" => {
+            lines.push(Line::from(""));
             for item in &msg.items {
                 if let TurnItem::Text(text) = item {
                     for line in text.lines() {
                         lines.push(Line::from(Span::styled(
-                            format!("> {}", truncate_chars(line, width.saturating_sub(4) as usize)),
-                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                            truncate_chars(line, width.saturating_sub(2) as usize),
+                            theme::user(),
                         )));
                     }
                 }
@@ -951,8 +1008,8 @@ fn render_message(msg: &ChatMessage, lines: &mut Vec<Line>, width: u16, show_rea
             render_turn_items(&msg.items, lines, width, show_reasoning);
             if let Some(ref usage) = msg.usage {
                 lines.push(Line::from(Span::styled(
-                    format!("  ── {} ──", usage),
-                    Style::default().fg(Color::DarkGray),
+                    format!("  ↳ {usage}"),
+                    theme::muted(),
                 )));
             }
             lines.push(Line::from(""));
@@ -961,8 +1018,8 @@ fn render_message(msg: &ChatMessage, lines: &mut Vec<Line>, width: u16, show_rea
             for item in &msg.items {
                 if let TurnItem::Text(t) = item {
                     lines.push(Line::from(Span::styled(
-                        format!("  ◇ {}", t),
-                        Style::default().fg(Color::Yellow),
+                        format!("  ◇ {t}"),
+                        theme::dim(),
                     )));
                 }
             }
@@ -975,33 +1032,29 @@ fn render_message(msg: &ChatMessage, lines: &mut Vec<Line>, width: u16, show_rea
 fn render_turn_items(items: &[TurnItem], lines: &mut Vec<Line>, width: u16, show_reasoning: bool) {
     for item in items {
         match item {
-            TurnItem::Step(n) => {
-                lines.push(Line::from(Span::styled(
-                    format!("  ── step {} ──", n),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
+            TurnItem::Step(_) => {}
             TurnItem::Tool(t) => {
                 lines.push(render_tool_line(t));
             }
             TurnItem::Diff { lines: diff_lines } => {
                 lines.push(Line::from(Span::styled(
-                    "  ┌ changes ─────────────────────────",
-                    Style::default().fg(Color::DarkGray),
+                    "  ┌ changes",
+                    theme::code_border(),
                 )));
                 for dl in diff_lines {
                     lines.push(styled_diff_line(dl));
                 }
                 lines.push(Line::from(Span::styled(
                     "  └──────────────────────────────────",
-                    Style::default().fg(Color::DarkGray),
+                    theme::code_border(),
                 )));
             }
             TurnItem::WrittenFile { path, content } => {
-                lines.push(Line::from(Span::styled(
-                    format!("  wrote {path}"),
-                    Style::default().fg(Color::DarkGray),
-                )));
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("✓ ", theme::success()),
+                    Span::styled(format!("wrote {path}"), theme::dim()),
+                ]));
                 let lang = std::path::Path::new(path)
                     .extension()
                     .and_then(|e| e.to_str())
@@ -1015,13 +1068,13 @@ fn render_turn_items(items: &[TurnItem], lines: &mut Vec<Line>, width: u16, show
             }
             TurnItem::Reasoning(r) if show_reasoning && !r.is_empty() => {
                 lines.push(Line::from(Span::styled(
-                    "  ▸ thinking",
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    "  + Thought",
+                    theme::thought(),
                 )));
                 for line in textwrap::fill(r, 58).lines() {
                     lines.push(Line::from(Span::styled(
-                        format!("    {}", line),
-                        Style::default().fg(Color::DarkGray),
+                        format!("    {line}"),
+                        theme::muted(),
                     )));
                 }
                 lines.push(Line::from(""));
@@ -1036,47 +1089,39 @@ fn render_turn_items(items: &[TurnItem], lines: &mut Vec<Line>, width: u16, show
 }
 
 fn render_tool_line(t: &ToolLine) -> Line<'static> {
-    let (status, status_style) = match &t.status {
-        ToolStatus::Running => (
-            "...".to_string(),
-            Style::default().fg(Color::Cyan),
-        ),
-        ToolStatus::Done { ms } => (
-            format_duration(*ms),
-            Style::default().fg(Color::Green),
-        ),
+    let target = truncate_chars(&t.target, 54);
+    let (suffix, suffix_style) = match &t.status {
+        ToolStatus::Running => (" …".to_string(), theme::tool_running()),
+        ToolStatus::Done { ms } => (format!("  {}", format_duration(*ms)), theme::muted()),
         ToolStatus::Error { msg, ms } => (
-            format!("✘ {} {}", truncate_chars(msg, 28), format_duration(*ms)),
-            Style::default().fg(Color::Red),
+            format!("  ✘ {} {}", truncate_chars(msg, 24), format_duration(*ms)),
+            theme::error(),
         ),
     };
 
-    let name = truncate_chars(&t.name, 10);
-    let target = truncate_chars(&t.target, 42);
-
     Line::from(vec![
         Span::raw("  "),
-        Span::styled(format!("{:<10}", name), Style::default().fg(Color::Cyan)),
+        Span::styled("% ", theme::muted()),
+        Span::styled(t.name.clone(), theme::status_accent()),
         Span::raw(" "),
-        Span::styled(target, Style::default().fg(Color::White)),
-        Span::raw(" "),
-        Span::styled(status, status_style),
+        Span::styled(target, theme::tool()),
+        Span::styled(suffix, suffix_style),
     ])
 }
 
 fn styled_diff_line(line: &str) -> Line<'static> {
-    let (color, text) = if line.starts_with('+') {
-        (Color::Green, format!("  │ +{}", &line[1..]))
+    let (style, text) = if line.starts_with('+') {
+        (theme::success(), format!("  │ +{}", &line[1..]))
     } else if line.starts_with('-') {
-        (Color::Red, format!("  │ -{}", &line[1..]))
+        (theme::error(), format!("  │ -{}", &line[1..]))
     } else if line.starts_with('~') {
-        (Color::Yellow, format!("  │ {}", line))
+        (Style::default().fg(Color::Yellow), format!("  │ {line}"))
     } else if line.starts_with(' ') {
-        (Color::DarkGray, format!("  │ {}", &line[1..]))
+        (theme::muted(), format!("  │ {}", &line[1..]))
     } else {
-        (Color::DarkGray, format!("  │ {}", line))
+        (theme::muted(), format!("  │ {line}"))
     };
-    Line::from(Span::styled(text, Style::default().fg(color)))
+    Line::from(Span::styled(text, style))
 }
 
 fn format_duration(ms: i64) -> String {
@@ -1105,52 +1150,70 @@ fn language_from_ext(ext: &str) -> &str {
 }
 
 fn help_lines<'a>(agent_kind: &'a str, session_label: &'a str) -> Vec<Line<'a>> {
-    let mode_line = format!("  mode: {agent_kind} · session: {session_label}");
     vec![
         Line::from(Span::styled(
             "  agent-engine",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            theme::status_accent().add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::raw(mode_line)),
+        Line::from(Span::styled(
+            format!("  {agent_kind} · session {session_label}"),
+            theme::dim(),
+        )),
         Line::from(""),
         Line::from(Span::styled(
-            "  Enter send · Shift+Enter newline · ↑↓ scroll · Ctrl+Y copy · Esc quit",
-            Style::default().fg(Color::White),
+            "  Enter send · Shift+Enter newline · ↑↓/wheel scroll · Ctrl+Y copy · Esc quit",
+            theme::body(),
         )),
         Line::from(Span::styled(
-            "  mouse drag + Cmd+C to select · /copy all · /help",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "  /new  /agent build|plan|general  /thinking  ·  cargo run --continue",
-            Style::default().fg(Color::DarkGray),
+            "  /copy all · /help · cargo run --continue",
+            theme::muted(),
         )),
     ]
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
+    let sp = SPINNER[(state.spinner as usize) % 4];
     let title = if state.thinking {
-        " running… "
+        format!(" {sp} running ")
     } else {
-        " Shift+Enter: newline "
+        "  Shift+Enter: newline ".to_string()
     };
+
     let block = Block::default()
         .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(title, Style::default().fg(Color::DarkGray)));
+        .border_style(theme::muted())
+        .title(Span::styled(
+            title,
+            if state.thinking {
+                theme::tool_running()
+            } else {
+                theme::muted()
+            },
+        ));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let mut input_lines: Vec<Line> = Vec::new();
-    if state.input.is_empty() {
-        input_lines.push(Line::from(Span::styled("> ", Style::default().fg(Color::DarkGray))));
+    if state.thinking {
+        input_lines.push(Line::from(vec![
+            Span::styled("▌ ", theme::status_accent()),
+            Span::styled("working…  ↑↓ scroll", theme::muted()),
+        ]));
+    } else if state.input.is_empty() {
+        input_lines.push(Line::from(Span::styled("▌ ", theme::status_accent())));
     } else {
         for (i, line) in state.input.lines().enumerate() {
-            let prefix = if i == 0 { "> " } else { "  " };
             input_lines.push(Line::from(vec![
-                Span::styled(prefix, Style::default().fg(Color::Green)),
-                Span::styled(line, Style::default().fg(Color::White)),
+                Span::styled(
+                    if i == 0 { "▌ " } else { "  " },
+                    if i == 0 {
+                        theme::status_accent()
+                    } else {
+                        theme::muted()
+                    },
+                ),
+                Span::styled(line, theme::input_text()),
             ]));
         }
     }
@@ -1167,18 +1230,17 @@ fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
-    let ch = SPINNER[(state.spinner as usize) % 4];
-    let cache = if state.usage_cache > 0 {
-        format!(" · cache:{}", state.usage_cache)
-    } else {
-        String::new()
-    };
     let phase = if state.pending_permission.is_some() {
         "permission"
     } else if state.thinking {
         "running"
     } else {
         "ready"
+    };
+    let cache = if state.usage_cache > 0 {
+        format!(" · cache:{}", state.usage_cache)
+    } else {
+        String::new()
     };
     let scroll_pos = resolve_scroll(state.scroll, state.max_scroll);
     let scroll_hint = if state.max_scroll == 0 {
@@ -1188,22 +1250,24 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         format!(" · scroll {scroll_pos}/{}", state.max_scroll)
     };
-    let s = format!(
-        " {} {} · {} · {}↑{}↓{}{} · {} · {} · PgUp/Dn",
-        ch,
-        state.agent_kind,
-        state.model,
-        state.usage_in,
-        state.usage_out,
-        cache,
-        scroll_hint,
-        state.session_label,
-        phase,
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(s, Style::default().fg(Color::DarkGray)))),
-        area,
-    );
+
+    let icon = if state.thinking {
+        SPINNER[(state.spinner as usize) % 4].to_string()
+    } else {
+        "■".to_string()
+    };
+
+    let line = Line::from(vec![
+        Span::styled(format!("{icon} "), theme::status_accent()),
+        Span::styled(state.agent_kind.clone(), theme::status_mode()),
+        Span::styled(format!(" · {} · ", state.model), theme::status_meta()),
+        Span::styled(
+            format!("{}↑{}↓{cache}{scroll_hint}", state.usage_in, state.usage_out),
+            theme::status_meta(),
+        ),
+        Span::styled(format!(" · {} · {phase}", state.session_label), theme::status_meta()),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_permission_modal(frame: &mut Frame, state: &AppState) {
@@ -1226,17 +1290,17 @@ fn draw_permission_modal(frame: &mut Frame, state: &AppState) {
         Line::from(""),
         Line::from(Span::styled(
             format!("  Allow tool: {}", perm.tool_name),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            theme::body().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
             format!("  {}", perm.input_summary),
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         )),
         Line::from(""),
         Line::from(Span::styled(
             "  y allow   n deny   Esc deny",
-            Style::default().fg(Color::Cyan),
+            theme::status_accent(),
         )),
     ];
 

@@ -1,4 +1,5 @@
 mod markdown_render;
+mod theme;
 
 pub mod agent;
 pub mod context;

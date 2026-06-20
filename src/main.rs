@@ -116,15 +116,37 @@ fn parse_agent_kind(name: &str) -> Option<AgentKind> {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
+    let (agent_kind, continue_session) = parse_args();
+
+    // OpenCode enters alt screen before DB/app init; do the same so cargo scrollback stays hidden.
+    let mut terminal = tui::setup_terminal()?;
+    terminal.draw(|f| tui::draw_boot(f, "Starting agent-engine…"))?;
+
+    let run_result = run_app(
+        &mut terminal,
+        agent_kind,
+        continue_session,
+    )
+    .await;
+
+    tui::restore_terminal();
+    run_result
+}
+
+async fn run_app(
+    terminal: &mut tui::AppTerminal,
+    agent_kind: AgentKind,
+    continue_session: bool,
+) -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("error")),
         )
         .init();
 
-    let (agent_kind, continue_session) = parse_args();
-    let def = agent_def_for(agent_kind);
+    terminal.draw(|f| tui::draw_boot(f, "Loading storage…"))?;
 
+    let def = agent_def_for(agent_kind);
     let storage = Arc::new(Storage::new()?);
     let sessions = storage.list_sessions().ok();
 
@@ -143,8 +165,28 @@ async fn main() -> Result<(), anyhow::Error> {
             (id, Vec::new())
         };
 
-    let api_key = std::env::var("DEEPSEEK_API_KEY")
-        .expect("DEEPSEEK_API_KEY environment variable required");
+    let api_key = match std::env::var("DEEPSEEK_API_KEY") {
+        Ok(key) => key,
+        Err(_) => {
+            loop {
+                terminal.draw(|f| {
+                    tui::draw_boot(
+                        f,
+                        "DEEPSEEK_API_KEY is not set.\n\n\
+                         export DEEPSEEK_API_KEY=sk-…\n\
+                         cargo run\n\n\
+                         Press Esc to quit.",
+                    )
+                })?;
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
+                        break;
+                    }
+                }
+            }
+            return Ok(());
+        }
+    };
 
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ProgressEvent>();
     let (permission_bridge, permission_rx) = PermissionBridge::pair();
@@ -172,7 +214,8 @@ async fn main() -> Result<(), anyhow::Error> {
         agent.load_history(prior_messages.clone()).await;
     }
 
-    let mut terminal = tui::setup_terminal()?;
+    terminal.draw(|f| tui::draw_boot(f, "Ready."))?;
+
     let mut state = AppState::new(def.name, &session_id);
     let mut current_kind = agent_kind;
 
@@ -250,7 +293,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
                         state.add_user_message(&input);
                         run_agent_turn(
-                            &mut terminal,
+                            terminal,
                             &mut state,
                             &agent,
                             &input,
@@ -271,11 +314,13 @@ async fn main() -> Result<(), anyhow::Error> {
                     _ => {}
                 }
             }
+            Event::Mouse(m) => {
+                tui::handle_scroll_mouse(&mut state, m.kind);
+            }
             _ => {}
         }
     }
 
-    tui::restore_terminal()?;
     Ok(())
 }
 

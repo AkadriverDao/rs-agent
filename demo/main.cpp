@@ -118,5 +118,8 @@ int main() {
 
     bfs(graph, 0);
 
+    // --- DFS demo ---
+    dfs(graph, 0);
+
     return 0;
 }

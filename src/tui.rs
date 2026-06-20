@@ -138,6 +138,9 @@ impl ActiveTurn {
                 lines.push(format!("+{rest}"));
             } else if let Some(rest) = line.strip_prefix('-') {
                 lines.push(format!("-{rest}"));
+            } else if let Some(rest) = line.strip_prefix('~') {
+                // Modified file marker — show as yellow
+                lines.push(format!("~{rest}"));
             } else if let Some(rest) = line.strip_prefix(' ') {
                 // Context lines — required for readable code structure
                 lines.push(format!(" {rest}"));

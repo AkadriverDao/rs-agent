@@ -513,7 +513,7 @@ async fn run_agent_turn(
     let (tx, rx) = tokio::sync::oneshot::channel();
     let agent = agent.clone();
     let input = input.to_string();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let result = agent.run(&input).await;
         let _ = tx.send(result);
     });
@@ -524,7 +524,11 @@ async fn run_agent_turn(
             state.take_permission_request(req);
         }
 
-        tui::poll_scroll_input(state);
+        if tui::poll_scroll_input(state) {
+            handle.abort();
+            state.push_turn_error("Interrupted by user");
+            break;
+        }
 
         tokio::select! {
             ev = progress_rx.recv() => {
@@ -553,7 +557,11 @@ async fn run_agent_turn(
                 while let Ok(req) = permission_rx.try_recv() {
                     state.take_permission_request(req);
                 }
-                tui::poll_scroll_input(state);
+                if tui::poll_scroll_input(state) {
+                    handle.abort();
+                    state.push_turn_error("Interrupted by user");
+                    break;
+                }
                 if state.has_pending_permission() {
                     poll_permission_keys(terminal, state)?;
                 }

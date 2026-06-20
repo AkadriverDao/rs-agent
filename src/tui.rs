@@ -873,12 +873,22 @@ pub fn handle_scroll_mouse(state: &mut AppState, kind: MouseEventKind) -> bool {
 }
 
 /// Poll scroll keys without blocking (safe during agent runs).
-pub fn poll_scroll_input(state: &mut AppState) {
+/// Returns `true` if the user requested interrupt (Esc / Ctrl+C).
+pub fn poll_scroll_input(state: &mut AppState) -> bool {
     while event::poll(Duration::from_millis(0)).unwrap_or(false) {
         match event::read() {
             Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                if !try_copy_key(state, key.code, key.modifiers) {
-                    handle_scroll_key(state, key.code, key.modifiers);
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('c')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        return true;
+                    }
+                    _ => {
+                        if !try_copy_key(state, key.code, key.modifiers) {
+                            handle_scroll_key(state, key.code, key.modifiers);
+                        }
+                    }
                 }
             }
             Ok(Event::Mouse(m)) => {
@@ -887,6 +897,7 @@ pub fn poll_scroll_input(state: &mut AppState) {
             _ => {}
         }
     }
+    false
 }
 
 // ── Draw ──
@@ -1041,14 +1052,14 @@ fn render_turn_items(items: &[TurnItem], lines: &mut Vec<Line>, width: u16, show
             }
             TurnItem::Diff { lines: diff_lines } => {
                 lines.push(Line::from(Span::styled(
-                    "  ┌ changes",
+                    "  ┌─ changes ─────────────────────────────",
                     theme::code_border(),
                 )));
                 for dl in diff_lines {
                     lines.push(styled_diff_line(dl));
                 }
                 lines.push(Line::from(Span::styled(
-                    "  └──────────────────────────────────",
+                    "  └────────────────────────────────────────",
                     theme::code_border(),
                 )));
             }

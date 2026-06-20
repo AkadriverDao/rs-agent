@@ -597,6 +597,11 @@ impl Agent {
                     tool_error_rounds = 0;
                 }
 
+                // Reset sterile rounds if any tool succeeded (e.g. write-only rounds are productive)
+                if results.iter().any(|(_, r)| r.is_ok()) {
+                    sterile_rounds = 0;
+                }
+
                 // Emit diff after modifier tools complete
                 if has_modifier {
                     if let Some(git) = crate::tools::get_git_manager() {

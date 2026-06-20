@@ -597,6 +597,17 @@ impl Agent {
                     tool_error_rounds = 0;
                 }
 
+                // Emit diff after modifier tools complete
+                if has_modifier {
+                    if let Some(git) = crate::tools::get_git_manager() {
+                        if let Ok(diff) = git.diff_uncommitted() {
+                            if !diff.is_empty() {
+                                self.emit(ProgressEvent::DiffAvailable { diff }).await;
+                            }
+                        }
+                    }
+                }
+
                 self.emit(ProgressEvent::StepFinished {
                     iteration,
                     tool_count: pending_tool_calls.len(),

@@ -29,6 +29,36 @@ void bfs(const std::vector<std::vector<int>>& graph, int start) {
     std::cout << std::endl;
 }
 
+// DFS: Depth-First Search on a graph represented as adjacency list
+// graph: adjacency list, start: starting node index
+void dfs(const std::vector<std::vector<int>>& graph, int start) {
+    int n = graph.size();
+    std::vector<bool> visited(n, false);
+    std::vector<int> stack;
+
+    stack.push_back(start);
+
+    std::cout << "DFS traversal starting from node " << start << ": ";
+
+    while (!stack.empty()) {
+        int node = stack.back();
+        stack.pop_back();
+
+        if (visited[node]) continue;
+        visited[node] = true;
+        std::cout << node << " ";
+
+        // Push neighbors in reverse order so that smaller-index neighbors
+        // are processed first (consistent with typical DFS order)
+        for (auto it = graph[node].rbegin(); it != graph[node].rend(); ++it) {
+            if (!visited[*it]) {
+                stack.push_back(*it);
+            }
+        }
+    }
+    std::cout << std::endl;
+}
+
 int partition(int arr[], int low, int high) {
     int pivot = arr[high];
     int i = low - 1;

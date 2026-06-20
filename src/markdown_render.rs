@@ -281,10 +281,8 @@ pub fn render_code_block(lang: &Option<String>, lines: &[String], out: &mut Vec<
 /// Basic syntax highlighting for common languages.
 /// Uses simple keyword/pattern matching — no full parser.
 fn highlight_syntax(line: &str, lang: &str) -> Vec<Span<'static>> {
-    use ratatui::style::Modifier;
-
     let trimmed = line.trim();
-    let indent = &line[..line.len() - trimmed.len()];
+    let _indent = &line[..line.len() - trimmed.len()];
 
     // Common keywords across languages
     let keywords = match lang {

@@ -261,10 +261,14 @@ pub fn render_code_block(lang: &Option<String>, lines: &[String], out: &mut Vec<
     let w = max_width.saturating_sub(6) as usize;
     for line in lines {
         for chunk in wrap_line_chunks(line, w) {
-            out.push(Line::from(vec![
-                Span::styled("  │ ", theme::code_border()),
-                Span::styled(chunk, theme::code_body()),
-            ]));
+            let styled_spans = if let Some(lang_name) = lang {
+                highlight_syntax(&chunk, lang_name)
+            } else {
+                vec![Span::styled(chunk, theme::code_body())]
+            };
+            let mut spans = vec![Span::styled("  │ ", theme::code_border())];
+            spans.extend(styled_spans);
+            out.push(Line::from(spans));
         }
     }
     out.push(Line::from(Span::styled(
@@ -272,6 +276,187 @@ pub fn render_code_block(lang: &Option<String>, lines: &[String], out: &mut Vec<
         theme::code_border(),
     )));
     out.push(Line::from(""));
+}
+
+/// Basic syntax highlighting for common languages.
+/// Uses simple keyword/pattern matching — no full parser.
+fn highlight_syntax(line: &str, lang: &str) -> Vec<Span<'static>> {
+    use ratatui::style::Modifier;
+
+    let trimmed = line.trim();
+    let indent = &line[..line.len() - trimmed.len()];
+
+    // Common keywords across languages
+    let keywords = match lang {
+        "rust" | "rs" => &[
+            "fn", "let", "mut", "const", "static", "if", "else", "match", "for", "while",
+            "loop", "return", "pub", "use", "mod", "struct", "enum", "impl", "trait",
+            "async", "await", "move", "ref", "where", "type", "self", "super", "crate",
+            "in", "as", "true", "false", "Some", "None", "Ok", "Err",
+            "unsafe", "dyn", "abstract", "final", "override",
+        ][..],
+        "python" | "py" => &[
+            "def", "class", "if", "elif", "else", "for", "while", "return", "import",
+            "from", "as", "with", "try", "except", "finally", "raise", "yield",
+            "lambda", "pass", "break", "continue", "and", "or", "not", "in", "is",
+            "True", "False", "None", "self", "async", "await",
+        ][..],
+        "javascript" | "js" | "ts" | "tsx" | "typescript" => &[
+            "function", "const", "let", "var", "if", "else", "for", "while", "return",
+            "import", "export", "from", "as", "class", "extends", "new", "this",
+            "async", "await", "try", "catch", "throw", "switch", "case", "default",
+            "break", "continue", "true", "false", "null", "undefined", "typeof",
+            "instanceof", "yield", "in", "of",
+        ][..],
+        "bash" | "sh" | "shell" => &[
+            "if", "then", "else", "elif", "fi", "for", "while", "do", "done",
+            "case", "esac", "function", "return", "export", "local", "source",
+            "echo", "exit", "set", "unset", "trap",
+        ][..],
+        "json" => &[],
+        "toml" => &[],
+        "yaml" | "yml" => &[],
+        "markdown" | "md" => &[],
+        "cpp" | "c" | "h" | "hpp" => &[
+            "if", "else", "for", "while", "do", "switch", "case", "break",
+            "return", "continue", "struct", "class", "enum", "union",
+            "typedef", "using", "namespace", "template", "typename",
+            "public", "private", "protected", "virtual", "override",
+            "const", "static", "extern", "inline", "auto", "void",
+            "int", "char", "float", "double", "bool", "true", "false",
+            "nullptr", "include", "define", "pragma",
+        ][..],
+        _ => &[],
+    };
+
+    if line.trim().is_empty() {
+        return vec![Span::raw(line.to_string())];
+    }
+
+    // Handle comments
+    let comment_prefixes = match lang {
+        "rust" | "rs" | "cpp" | "c" | "h" | "hpp" | "js" | "ts" | "tsx" => Some("//"),
+        "python" | "py" | "bash" | "sh" | "shell" | "yaml" | "yml" | "toml" => Some("#"),
+        _ => None,
+    };
+
+    if let Some(prefix) = comment_prefixes {
+        if let Some(pos) = line.find(prefix) {
+            let before = &line[..pos];
+            let comment = &line[pos..];
+            let mut spans = tokenize_line(before, keywords, lang);
+            spans.push(Span::styled(comment.to_string(), theme::dim()));
+            return spans;
+        }
+    }
+
+    // Handle strings (double-quoted)
+    if line.contains('"') {
+        let mut spans = Vec::new();
+        let mut rest = line;
+        while !rest.is_empty() {
+            if let Some(start) = rest.find('"') {
+                // Push text before string
+                if start > 0 {
+                    spans.extend(tokenize_line(&rest[..start], keywords, lang));
+                }
+                // Find end of string
+                let after_quote = &rest[start + 1..];
+                if let Some(end) = after_quote.find('"') {
+                    let str_content = &rest[start..=start + 1 + end];
+                    spans.push(Span::styled(str_content.to_string(), theme::success()));
+                    rest = &after_quote[end + 1..];
+                } else {
+                    // Unterminated string
+                    spans.push(Span::styled(rest[start..].to_string(), theme::success()));
+                    break;
+                }
+            } else {
+                spans.extend(tokenize_line(rest, keywords, lang));
+                break;
+            }
+        }
+        return spans;
+    }
+
+    // Handle single-quoted strings (Python, bash)
+    if line.contains('\'') && (lang == "python" || lang == "py" || lang == "bash" || lang == "sh") {
+        let mut spans = Vec::new();
+        let mut rest = line;
+        while !rest.is_empty() {
+            if let Some(start) = rest.find('\'') {
+                if start > 0 {
+                    spans.extend(tokenize_line(&rest[..start], keywords, lang));
+                }
+                let after_quote = &rest[start + 1..];
+                if let Some(end) = after_quote.find('\'') {
+                    let str_content = &rest[start..=start + 1 + end];
+                    spans.push(Span::styled(str_content.to_string(), theme::success()));
+                    rest = &after_quote[end + 1..];
+                } else {
+                    spans.push(Span::styled(rest[start..].to_string(), theme::success()));
+                    break;
+                }
+            } else {
+                spans.extend(tokenize_line(rest, keywords, lang));
+                break;
+            }
+        }
+        return spans;
+    }
+
+    tokenize_line(line, keywords, lang)
+}
+
+/// Tokenize a line (without comments/strings) into styled spans.
+fn tokenize_line(line: &str, keywords: &[&str], _lang: &str) -> Vec<Span<'static>> {
+    if line.trim().is_empty() {
+        return vec![Span::raw(line.to_string())];
+    }
+
+    let mut spans = Vec::new();
+    let mut current = String::new();
+
+    // Characters that act as word separators
+    let separators = |c: char| c.is_whitespace() || "(){}[]<>.,;:!?=+-*/&|^~%@#".contains(c);
+
+    for ch in line.chars() {
+        if separators(ch) {
+            if !current.is_empty() {
+                spans.push(styled_word(&current, keywords));
+                current.clear();
+            }
+            spans.push(Span::raw(ch.to_string()));
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        spans.push(styled_word(&current, keywords));
+    }
+
+    spans
+}
+
+fn styled_word(word: &str, keywords: &[&str]) -> Span<'static> {
+    // Check if it's a keyword
+    if keywords.contains(&word) {
+        return Span::styled(word.to_string(), theme::keyword());
+    }
+    // Check if it looks like a number
+    if word.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '_')
+        && word.chars().any(|c| c.is_ascii_digit())
+    {
+        return Span::styled(word.to_string(), theme::number());
+    }
+    // Check if it's uppercase (constants/types in Rust, etc.)
+    if word.chars().next().map_or(false, |c| c.is_uppercase())
+        && word.len() > 1
+        && word.chars().all(|c| c.is_alphanumeric() || c == '_')
+    {
+        return Span::styled(word.to_string(), theme::type_name());
+    }
+    Span::styled(word.to_string(), theme::code_body())
 }
 
 /// Soft-wrap a single line to display width without dropping characters.

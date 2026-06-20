@@ -466,11 +466,7 @@ async fn handle_slash_command(
         }
         "/clear" => {
             // Clear only the conversation messages, keep input area and status bar intact
-            state.messages.clear();
-            state.scroll = usize::MAX;
-            state.thinking = false;
-            state.active_turn = None;
-            state.tool_starts.clear();
+            state.clear_conversation();
             state.add_system_message("Conversation cleared.");
         }
         "/agent" => {

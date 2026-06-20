@@ -77,3 +77,15 @@ pub fn status_accent() -> Style {
 pub fn input_text() -> Style {
     Style::default().fg(Color::White)
 }
+
+pub fn keyword() -> Style {
+    Style::default().fg(Color::Cyan)
+}
+
+pub fn number() -> Style {
+    Style::default().fg(Color::Yellow)
+}
+
+pub fn type_name() -> Style {
+    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+}
